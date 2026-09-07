@@ -1,244 +1,102 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>VoiceFlow — Full-Duplex Voice Agent with Interruption Recovery</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <title>Interrepto — Voice AI Agent</title>
+  <link rel="stylesheet" href="style.css" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-  <div class="app-container">
-    <!-- Header -->
-    <header class="app-header">
-      <div class="brand-section">
-        <div class="logo-mark">
-          <div class="pulse-ring"></div>
-          <span class="logo-icon">⚡</span>
+  <div class="app-layout">
+
+    <!-- Top Header Bar -->
+    <header class="top-bar">
+      <div class="top-bar-left">
+        <div class="logo-circle">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"></circle>
+            <path d="M12 8v4l3 3"></path>
+          </svg>
         </div>
-        <div>
-          <div class="title-row">
-            <h1>VoiceFlow</h1>
-            <span class="badge badge-primary">RIME HACKATHON 2026</span>
-            <span class="badge badge-success">FULL-DUPLEX</span>
-          </div>
-          <p class="subtitle">Voice-Native Agent with Sub-300ms Barge-In Interruption Recovery & Zero Stale Speech</p>
-        </div>
+        <span class="app-name">ChatGPT</span>
+        <span class="model-chip" id="model-chip">Voice</span>
       </div>
-      <div class="provider-pill">
-        <div class="status-indicator online"></div>
-        <div class="provider-info">
-          <span class="provider-name">RIME AI TTS</span>
-          <span class="provider-sub">Model: <strong>arcana</strong> | Voice: <strong>astra</strong> (16kHz)</span>
-        </div>
+      <div class="top-bar-right">
+        <span class="audio-only-badge">
+          <span class="live-dot"></span>
+          Audio Only
+        </span>
       </div>
     </header>
 
-    <!-- Telemetry Cards -->
-    <section class="metrics-grid">
-      <div class="metric-card highlight-card">
-        <div class="metric-header">
-          <span class="metric-title">INTERRUPTION LATENCY</span>
-          <span class="metric-target">TARGET &lt;300ms</span>
+    <!-- Main Voice Area -->
+    <main class="voice-stage">
+
+      <!-- Central Orb -->
+      <div class="orb-wrapper" id="orb-wrapper">
+        <div class="orb-rings">
+          <div class="ring r1"></div>
+          <div class="ring r2"></div>
+          <div class="ring r3"></div>
         </div>
-        <div class="metric-value-row">
-          <span class="metric-number" id="interruption-latency-val">24.5</span>
-          <span class="metric-unit">ms</span>
-        </div>
-        <div class="metric-footer">
-          <span class="status-tag success" id="interruption-status">TARGET MET (p90: 32ms)</span>
-          <span class="metric-subtext">User barge-in → TTS cutoff</span>
+        <div class="orb-core" id="orb-core">
+          <canvas id="wave-canvas" width="300" height="300"></canvas>
         </div>
       </div>
 
-      <div class="metric-card">
-        <div class="metric-header">
-          <span class="metric-title">TIME-TO-FIRST-AUDIO (TTFA)</span>
-          <span class="metric-target">TARGET &lt;400ms</span>
-        </div>
-        <div class="metric-value-row">
-          <span class="metric-number" id="ttfa-val">46.2</span>
-          <span class="metric-unit">ms</span>
-        </div>
-        <div class="metric-footer">
-          <span class="status-tag success">OPTIMAL (p90: 52ms)</span>
-          <span class="metric-subtext">Speech end → 1st Rime byte</span>
-        </div>
+      <!-- Status Text -->
+      <div class="status-text" id="status-text">Tap the microphone to begin</div>
+
+      <!-- Interruption Badge -->
+      <div class="interrupt-badge" id="interrupt-badge">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+        </svg>
+        Interrupted
       </div>
 
-      <div class="metric-card">
-        <div class="metric-header">
-          <span class="metric-title">STATE CONSISTENCY</span>
-          <span class="metric-target">TARGET 100%</span>
-        </div>
-        <div class="metric-value-row">
-          <span class="metric-number" id="state-val">100</span>
-          <span class="metric-unit">%</span>
-        </div>
-        <div class="metric-footer">
-          <span class="status-tag success" id="stale-status">ZERO STALE SPEECH</span>
-          <span class="metric-subtext">Stale tools discarded: 100%</span>
-        </div>
+      <!-- User Speech Bubble -->
+      <div class="user-bubble" id="user-bubble">
+        <span class="bubble-label">You</span>
+        <span class="bubble-text" id="bubble-text">...</span>
       </div>
 
-      <div class="metric-card">
-        <div class="metric-header">
-          <span class="metric-title">RIME TRANSPORT</span>
-          <span class="metric-target">FULL-DUPLEX</span>
-        </div>
-        <div class="metric-value-row">
-          <span class="metric-text" id="transport-status">WebSocket</span>
-        </div>
-        <div class="metric-footer">
-          <span class="status-tag info">Bilingual (en / hi-IN)</span>
-          <span class="metric-subtext">Writing for the Ear prosody</span>
-        </div>
-      </div>
-    </section>
-
-    <!-- Main Workspace -->
-    <main class="main-workspace">
-      <!-- Left Column: Voice Visualizer & Controls -->
-      <section class="voice-center-panel">
-        <div class="panel-card visualizer-card">
-          <div class="panel-header">
-            <div class="header-left">
-              <span class="dot-indicator" id="agent-state-dot"></span>
-              <span class="panel-title" id="agent-state-label">Agent Idle — Ready for Voice Input</span>
-            </div>
-            <div class="mode-toggles">
-              <label class="toggle-switch">
-                <input type="checkbox" id="toggle-tool-delay" checked>
-                <span class="slider"></span>
-                <span class="label-text">Simulate 3s Tool Latency</span>
-              </label>
-            </div>
-          </div>
-
-          <!-- Waveform Visualizer Canvas -->
-          <div class="canvas-wrapper">
-            <canvas id="waveform-canvas" width="800" height="200"></canvas>
-            <div class="interruption-flash" id="interruption-flash">
-              <span>⚡ BARGE-IN DETECTED: TTS CUT OFF IN 24ms</span>
-            </div>
-          </div>
-
-          <!-- Live Spoken Subtitle Banner -->
-          <div class="transcript-banner">
-            <div class="transcript-label">AGENT SPEECH OUTPUT (RIME AI):</div>
-            <div class="transcript-text" id="spoken-transcript">
-              "Press Speak or click a scenario below to start full-duplex technician dialogue."
-            </div>
-          </div>
-
-          <!-- Action Controls -->
-          <div class="controls-toolbar">
-            <button class="btn btn-primary btn-mic" id="btn-mic">
-              <span class="mic-icon">🎙️</span>
-              <span id="mic-label">Hold or Click to Speak</span>
-            </button>
-
-            <button class="btn btn-danger btn-interrupt" id="btn-interrupt">
-              <span class="zap-icon">⚡</span>
-              <span>TRIGGER BARGE-IN (<300ms)</span>
-            </button>
-          </div>
-        </div>
-
-        <!-- Stress Testing & Acceptance Scenarios -->
-        <div class="panel-card scenarios-card">
-          <div class="panel-header">
-            <span class="panel-title">Stress Test Scenarios (PRD Validations)</span>
-            <span class="badge badge-secondary">Quick Trigger</span>
-          </div>
-
-          <div class="scenarios-grid">
-            <div class="scenario-item" data-action="m12_normal">
-              <div class="scenario-icon">🔧</div>
-              <div class="scenario-details">
-                <span class="scenario-title">1. Normal Spec Query</span>
-                <span class="scenario-desc">"What is the torque spec for bolt M12?" (85 Nm)</span>
-              </div>
-              <button class="btn-play-scenario">Run</button>
-            </div>
-
-            <div class="scenario-item stress-highlight" data-action="m12_interrupt">
-              <div class="scenario-icon">⚡</div>
-              <div class="scenario-details">
-                <span class="scenario-title">2. Mid-Response Interruption</span>
-                <span class="scenario-desc">Interrupts mid-sentence with "Actually for 2024 model" (92 Nm)</span>
-              </div>
-              <button class="btn-play-scenario">Test Barge-In</button>
-            </div>
-
-            <div class="scenario-item" data-action="tool_interrupt">
-              <div class="scenario-icon">⏳</div>
-              <div class="scenario-details">
-                <span class="scenario-title">3. Interruption During 3s Tool Call</span>
-                <span class="scenario-desc">Interrupts slow database query; verifies stale output is discarded</span>
-              </div>
-              <button class="btn-play-scenario">Test Async Discard</button>
-            </div>
-
-            <div class="scenario-item" data-action="code_switch">
-              <div class="scenario-icon">🇮🇳</div>
-              <div class="scenario-details">
-                <span class="scenario-title">4. Hindi-English Code-Switching</span>
-                <span class="scenario-desc">"Mera order status batao, order number 170 hai" (Rime Arcana v2)</span>
-              </div>
-              <button class="btn-play-scenario">Test Code-Switch</button>
-            </div>
-          </div>
-
-          <div class="eval-suite-banner">
-            <div class="eval-text">
-              <strong>Automated Hackathon Acceptance Test Suite:</strong> Run all 20 PRD test fixtures (domain specs, numbers, barge-ins, code-switching).
-            </div>
-            <button class="btn btn-success" id="btn-run-all-evals">
-              <span>▶ RUN 20 EVAL FIXTURES</span>
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <!-- Right Column: Live Turn Inspector & State Reconciliation Log -->
-      <aside class="audit-panel">
-        <div class="panel-card audit-card">
-          <div class="panel-header">
-            <span class="panel-title">Turn & State Timeline Inspector</span>
-            <button class="btn-clear" id="btn-clear-log">Clear</button>
-          </div>
-
-          <div class="timeline-container" id="timeline-log">
-            <!-- Dynamic events will be prepended here -->
-            <div class="timeline-event event-info">
-              <div class="event-time">System</div>
-              <div class="event-body">
-                <strong>VoiceFlow Initialized</strong>
-                <p>Full-duplex transport ready. Rime Arcana v2 active. Interruption detector armed.</p>
-              </div>
-            </div>
-          </div>
-        </div>
-      </aside>
     </main>
 
-    <!-- Eval Modal / Results Viewer -->
-    <div class="modal-overlay" id="eval-modal">
-      <div class="modal-box">
-        <div class="modal-header">
-          <h3>Acceptance Test Results (20 Fixtures)</h3>
-          <button class="modal-close" id="modal-close">&times;</button>
+    <!-- Bottom Input Bar -->
+    <footer class="bottom-bar">
+      <div class="input-row">
+        <div class="input-pill">
+          <input
+            type="text"
+            id="text-input"
+            placeholder="Message ChatGPT"
+            autocomplete="off"
+          />
+          <button class="send-btn" id="send-btn" title="Send">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="19" x2="12" y2="5"></line>
+              <polyline points="5 12 12 5 19 12"></polyline>
+            </svg>
+          </button>
+          <button class="mic-btn" id="mic-btn" title="Start voice conversation">
+            <div class="mic-ring"></div>
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+              <line x1="12" y1="19" x2="12" y2="22"></line>
+            </svg>
+          </button>
         </div>
-        <div class="modal-body" id="modal-results-content">
-          <div class="spinner"></div> Running 20 evaluation fixtures...
-        </div>
+        <p class="footer-hint">AI responds in voice only &mdash; speak anytime to interrupt</p>
       </div>
-    </div>
+    </footer>
+
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

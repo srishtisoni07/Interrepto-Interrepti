@@ -30,7 +30,7 @@ class RimeClient:
         self.model = os.getenv("RIME_MODEL", model)
         self.voice = os.getenv("RIME_VOICE", voice)
         self.endpoint = os.getenv("RIME_ENDPOINT", endpoint)
-        self.sampling_rate = int(os.getenv("RIME_SAMPLING_RATE", sampling_rate))
+        self.sampling_rate = int(os.getenv("RIME_SAMPLING_RATE", 22050))
         self.audio_format = os.getenv("RIME_AUDIO_FORMAT", audio_format)
         
         # Check if live credentials are active
@@ -130,7 +130,7 @@ class RimeClient:
         text: str,
         cancellation_event: Optional[asyncio.Event]
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Calls Rime API over HTTP chunked streaming or WebSocket."""
+        """Calls Rime API, collects full WAV, yields as single playable chunk."""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -151,30 +151,34 @@ class RimeClient:
                     if resp.status != 200:
                         err_text = await resp.text()
                         logger.error(f"Rime API returned error {resp.status}: {err_text}")
-                        # Fallback to local streaming immediately
                         async for chunk in self._stream_emulated(text, cancellation_event):
                             yield chunk
                         return
 
-                    chunk_idx = 0
-                    async for chunk in resp.content.iter_chunked(2048):
+                    # Collect the full WAV response — Rime streams with unknown-size header,
+                    # so we must gather all bytes then let the browser decode via decodeAudioData().
+                    wav_chunks = []
+                    async for raw_chunk in resp.content.iter_chunked(4096):
                         if cancellation_event and cancellation_event.is_set():
-                            logger.info("Interruption received: Cancelling live Rime cloud stream.")
-                            yield {"chunk_index": chunk_idx, "audio_pcm": b"", "is_final": True, "cancelled": True}
+                            logger.info("Interruption: Cancelling Rime stream.")
+                            yield {"chunk_index": 0, "audio_pcm": b"", "is_final": True, "cancelled": True}
                             return
+                        wav_chunks.append(raw_chunk)
 
-                        yield {
-                            "chunk_index": chunk_idx,
-                            "audio_pcm": chunk,
-                            "is_final": False,
-                            "cancelled": False
-                        }
-                        chunk_idx += 1
-                        
-                    yield {"chunk_index": chunk_idx, "audio_pcm": b"", "is_final": True, "cancelled": False}
+                    full_wav = b"".join(wav_chunks)
+                    logger.info(f"Rime TTS done: {len(full_wav)} bytes WAV")
+
+                    # Single chunk with is_wav=True; frontend uses decodeAudioData()
+                    yield {
+                        "chunk_index": 0,
+                        "audio_pcm": full_wav,
+                        "is_wav": True,
+                        "is_final": True,
+                        "cancelled": False
+                    }
 
         except Exception as e:
-            logger.error(f"Rime cloud synthesis failed: {e}. Falling back to emulated streaming.")
+            logger.error(f"Rime cloud synthesis failed: {e}. Falling back to emulated.")
             async for chunk in self._stream_emulated(text, cancellation_event):
                 yield chunk
 

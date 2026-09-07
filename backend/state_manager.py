@@ -11,11 +11,7 @@ logger = logging.getLogger("voiceflow.state")
 class StateManager:
     def __init__(self):
         self.dialogue_history: List[Dict[str, Any]] = []
-        self.active_constraints: Dict[str, Any] = {
-            "model_year": "standard",
-            "component": "bolt M12",
-            "unit_system": "metric"
-        }
+        self.active_constraints: Dict[str, Any] = {}
 
     def add_user_message(self, text: str, turn_id: int):
         """Records user speech input."""

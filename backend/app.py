@@ -10,7 +10,7 @@ import base64
 import time
 import asyncio
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -24,12 +24,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 # Load environment configuration
-load_dotenv()
+env_path = os.path.join(PROJECT_ROOT, ".env")
+load_dotenv(env_path)
+
+# Safe configuration check
+gemini_key = os.getenv("GEMINI_API_KEY")
+print(f"GEMINI_API_KEY loaded: {'true' if gemini_key else 'false'}")
+
 
 from backend.rime_client import RimeClient
 from backend.interruption_manager import InterruptionManager
 from backend.state_manager import StateManager
 from backend.tools import query_equipment_database, EQUIPMENT_DATABASE
+from backend.llm_client import LLMClient
 
 # Setup logging
 logging.basicConfig(
@@ -56,54 +63,68 @@ app.add_middleware(
 rime_client = RimeClient()
 interruption_mgr = InterruptionManager()
 state_mgr = StateManager()
+llm_client = LLMClient()
 
 # Ensure frontend path exists
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
 
 
+async def generate_ai_response(
+    query: str,
+    constraints: Optional[Dict[str, Any]] = None,
+    dialogue_history: Optional[List[Dict[str, str]]] = None,
+    cancellation_event: Optional[asyncio.Event] = None
+) -> str:
+    """
+    Synthesizes AI response using live API (Gemini / OpenAI / Groq) or deterministic fallback.
+    Respects 'Writing for the Ear' prompting and cancellation events.
+    """
+    return await llm_client.generate_response(
+        query=query,
+        dialogue_history=dialogue_history,
+        constraints=constraints or state_mgr.active_constraints,
+        cancellation_event=cancellation_event
+    )
+
+
 def generate_llm_response(query: str, constraints: Dict[str, Any], interrupted: bool = False) -> str:
-    """
-    Synthesizes field technician assistant response adhering to Rime's 'Writing for the Ear'.
-    Uses fillers, commas for prosody, and exact numbers.
-    """
-    q_low = query.lower()
-    comp = constraints.get("component", "bolt M12")
-    year = constraints.get("model_year", "standard")
+    """Synchronous fallback helper for backwards compatibility."""
+    return llm_client.generate_fallback_response(query, constraints)
 
-    # Hindi-English Code-Switching scenario
-    if any(hi in q_low for hi in ["mera", "batao", "hai", "kya", "order number"]):
-        if "170" in q_low or comp == "order 170":
-            return "Ji Rahul ji, aapka order number 170 out for delivery hai, aur aaj shaam char baje tak deliver ho jayega."
-        return "Haan ji, main aapki maintenance details check kar raha hoon, bas ek second."
 
-    # Interrupted / Refined query for 2024 model
-    if "2024" in q_low or year == "2024":
-        return "Understood. For the 2024 revision of bolt M12, the torque spec is, um, 92 newton meters, with titanium washer."
+@app.post("/api/speak")
+async def speak_text(payload: Dict[str, Any]):
+    """Returns the synthesized audio directly as a WAV file."""
+    text = payload.get("text", "Hello, I am ready.")
+    
+    # We will generate it using the stream but collect it to return as a Response
+    # so that the response is actually in audio format.
+    chunks = []
+    async for chunk in rime_client.stream_synthesize(text):
+        if chunk.get("audio_pcm"):
+            chunks.append(chunk["audio_pcm"])
+            
+    # Depending on whether it's emulated or live, it might already be a full wav
+    # or raw PCM chunks.
+    audio_bytes = b"".join(chunks)
+    
+    # If it's emulated, we need to add a WAV header
+    if not rime_client.is_live:
+        header = rime_client.create_wav_header(len(audio_bytes), rime_client.sampling_rate)
+        audio_bytes = header + audio_bytes
 
-    # Standard bolt M12
-    if "m12" in q_low or comp == "bolt M12":
-        return "Right, the torque spec for bolt M12 is 85 newton meters. Um, make sure to lubricate threads lightly before torquing."
-
-    # Bolt M16
-    if "m16" in q_low or comp == "bolt M16":
-        return "For bolt M16, the spec is 170 newton meters. Please verify the torque wrench calibration first."
-
-    # Hydraulic pump
-    if "hydraulic" in q_low or "pump" in q_low:
-        return "Hydraulic pump HP-400 operates at 350 bar max pressure, with ISO VG 46 anti-wear fluid."
-
-    # Default concise technical response
-    return f"Copy that. For {query}, standard operating procedure is verified, torque is within normal parameters."
+    from fastapi import Response
+    return Response(content=audio_bytes, media_type="audio/wav")
 
 
 @app.get("/api/status")
 async def get_status():
-    """Returns runtime telemetry, active speech provider, and system health."""
+    """Returns runtime telemetry, active speech and AI providers, and system health."""
     metrics = interruption_mgr.get_metrics_summary()
     return JSONResponse({
         "status": "healthy",
         "agent": "VoiceFlow",
-        "provider": {
+        "speech_provider": {
             "name": "Rime AI",
             "model": rime_client.model,
             "voice": rime_client.voice,
@@ -112,12 +133,69 @@ async def get_status():
             "format": rime_client.audio_format,
             "transport": "WebSocket Streaming (Full-Duplex)"
         },
+        "ai_provider": {
+            "name": llm_client.provider.upper(),
+            "model": llm_client.model,
+            "live_api_connected": llm_client.is_live
+        },
         "target_metrics": {
             "interruption_latency_target_ms": 300.0,
             "ttfa_target_ms": 400.0,
             "state_consistency_target_pct": 100.0
         },
         "current_metrics": metrics
+    })
+
+
+@app.post("/api/config/ai")
+async def update_ai_config(payload: Dict[str, Any]):
+    """Updates AI provider, API key, or model at runtime and saves to .env."""
+    provider = payload.get("provider", "gemini")
+    api_key = payload.get("api_key", "").strip()
+    model = payload.get("model", None)
+
+    llm_client.update_config(provider, api_key, model)
+
+    # Save to .env if valid key provided
+    try:
+        env_path = os.path.join(PROJECT_ROOT, ".env")
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+        
+        updated_lines = []
+        key_name = f"{provider.upper()}_API_KEY"
+        provider_set = False
+        key_set = False
+
+        for line in lines:
+            if line.startswith("AI_PROVIDER="):
+                updated_lines.append(f"AI_PROVIDER={provider}\n")
+                provider_set = True
+            elif line.startswith(f"{key_name}="):
+                updated_lines.append(f"{key_name}={api_key}\n")
+                key_set = True
+            else:
+                updated_lines.append(line)
+
+        if not provider_set:
+            updated_lines.append(f"AI_PROVIDER={provider}\n")
+        if not key_set:
+            updated_lines.append(f"{key_name}={api_key}\n")
+
+        with open(env_path, "w") as f:
+            f.writelines(updated_lines)
+    except Exception as e:
+        logger.warning(f"Failed to write .env: {e}")
+
+    return JSONResponse({
+        "status": "updated",
+        "ai_provider": {
+            "name": llm_client.provider.upper(),
+            "model": llm_client.model,
+            "live_api_connected": llm_client.is_live
+        }
     })
 
 
@@ -154,8 +232,15 @@ async def run_single_fixture(payload: Dict[str, Any]):
             stale_tool_cancelled = barge_res.get("stale_tool_discarded", False)
             state_mgr.reconcile_after_interruption(turn.turn_id, interrupt_with)
             
-            # Now generate updated response
-            updated_text = generate_llm_response(interrupt_with, state_mgr.active_constraints)
+            # Create fresh turn for the new refined request
+            new_turn = interruption_mgr.create_turn(interrupt_with)
+            state_mgr.add_user_message(interrupt_with, new_turn.turn_id)
+            updated_text = await generate_ai_response(
+                interrupt_with,
+                constraints=state_mgr.active_constraints,
+                dialogue_history=state_mgr.get_context_for_llm(),
+                cancellation_event=new_turn.cancel_event
+            )
             ttfa_ms = (time.time() - t_start) * 1000.0
             return JSONResponse({
                 "test": "interruption_during_tool",
@@ -171,7 +256,12 @@ async def run_single_fixture(payload: Dict[str, Any]):
             await tool_task
 
     # Standard TTS generation
-    tts_text = generate_llm_response(query, state_mgr.active_constraints)
+    tts_text = await generate_ai_response(
+        query,
+        constraints=state_mgr.active_constraints,
+        dialogue_history=state_mgr.get_context_for_llm(),
+        cancellation_event=turn.cancel_event
+    )
     ttfa_ms = 48.0  # Emulated or actual Rime TTFA
     
     if interrupt_with:
@@ -179,7 +269,14 @@ async def run_single_fixture(payload: Dict[str, Any]):
         await asyncio.sleep(0.25)
         barge_res = interruption_mgr.handle_barge_in(new_input=interrupt_with)
         state_mgr.reconcile_after_interruption(turn.turn_id, interrupt_with)
-        reconciled_text = generate_llm_response(interrupt_with, state_mgr.active_constraints)
+        new_turn = interruption_mgr.create_turn(interrupt_with)
+        state_mgr.add_user_message(interrupt_with, new_turn.turn_id)
+        reconciled_text = await generate_ai_response(
+            interrupt_with,
+            constraints=state_mgr.active_constraints,
+            dialogue_history=state_mgr.get_context_for_llm(),
+            cancellation_event=new_turn.cancel_event
+        )
         
         return JSONResponse({
             "test": "mid_tts_barge_in",
@@ -263,7 +360,14 @@ async def run_all_eval_fixtures():
             lat = barge_res.get("interruption_latency_ms", 24.0)
             interruption_latencies.append(lat)
             state_mgr.reconcile_after_interruption(turn.turn_id, fix["interrupt"])
-            reconciled = generate_llm_response(fix["interrupt"], state_mgr.active_constraints)
+            new_turn = interruption_mgr.create_turn(fix["interrupt"])
+            state_mgr.add_user_message(fix["interrupt"], new_turn.turn_id)
+            reconciled = await generate_ai_response(
+                fix["interrupt"],
+                constraints=state_mgr.active_constraints,
+                dialogue_history=state_mgr.get_context_for_llm(),
+                cancellation_event=new_turn.cancel_event
+            )
             
             # Check state consistency
             if "2024" in fix["interrupt"]:
@@ -290,7 +394,12 @@ async def run_all_eval_fixtures():
             # Normal Flow
             ttfa = 45.0
             ttfa_latencies.append(ttfa)
-            resp = generate_llm_response(fix["query"], state_mgr.active_constraints)
+            resp = await generate_ai_response(
+                fix["query"],
+                constraints=state_mgr.active_constraints,
+                dialogue_history=state_mgr.get_context_for_llm(),
+                cancellation_event=turn.cancel_event
+            )
             state_pass_count += 1
             results.append({
                 "fixture_id": fix["id"],
@@ -329,22 +438,62 @@ async def voice_websocket_endpoint(websocket: WebSocket):
     - Bi-directional audio framing
     - Instant barge-in cancellation (<300ms cut-off)
     - Stale tool discard event notifications
+    - Stream tasks are independent of microphone state
     """
     await websocket.accept()
     logger.info("Client connected to /ws/voice full-duplex session")
     active_stream_task: Optional[asyncio.Task] = None
 
+    async def stream_tts_to_ws(text: str, cancel_event: asyncio.Event, is_barge_in: bool = False):
+        """Streams TTS chunks to the WebSocket. Errors in one chunk do not kill the stream."""
+        if not text:
+            logger.warning("stream_tts_to_ws called with empty text — skipping")
+            return
+        try:
+            async for chunk in rime_client.stream_synthesize(text, cancel_event):
+                if chunk.get("cancelled"):
+                    if not is_barge_in:
+                        await websocket.send_json({
+                            "type": "cancel_audio",
+                            "reason": "barge_in_mid_stream",
+                            "discarded_chunk": chunk.get("chunk_index", 0)
+                        })
+                    break
+                try:
+                    b64 = base64.b64encode(chunk["audio_pcm"]).decode("ascii") if chunk.get("audio_pcm") else ""
+                    await websocket.send_json({
+                        "type": "audio_chunk",
+                        "chunk_index": chunk["chunk_index"],
+                        "audio_base64": b64,
+                        "is_wav": chunk.get("is_wav", False),
+                        "is_final": chunk["is_final"],
+                        "text": text if chunk["chunk_index"] == 0 else ""
+                    })
+                except Exception as chunk_err:
+                    logger.error(f"Error sending audio chunk {chunk.get('chunk_index')}: {chunk_err}")
+                    # Don't break — try next chunk
+        except Exception as e:
+            logger.error(f"TTS streaming error: {e}")
+
     try:
         while True:
             raw_msg = await websocket.receive_text()
-            data = json.loads(raw_msg)
+            try:
+                data = json.loads(raw_msg)
+            except json.JSONDecodeError:
+                logger.warning("Received non-JSON WebSocket message, skipping")
+                continue
             msg_type = data.get("type")
 
             if msg_type == "barge_in" or msg_type == "interrupt":
                 # User interrupted while agent was speaking or fetching tools!
                 new_input = data.get("new_input", "")
                 barge_res = interruption_mgr.handle_barge_in(new_input=new_input)
-                
+
+                # Cancel any running stream task
+                if active_stream_task and not active_stream_task.done():
+                    active_stream_task.cancel()
+
                 # Send immediate cancel command to frontend audio buffer
                 await websocket.send_json({
                     "type": "cancel_audio",
@@ -354,31 +503,36 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                 })
 
                 if new_input:
-                    # Reconcile state immediately and produce new response
+                    # Reconcile state immediately and create fresh turn
                     state_mgr.reconcile_after_interruption(barge_res.get("turn_id", 1), new_input)
-                    reconciled_text = generate_llm_response(new_input, state_mgr.active_constraints)
-                    
-                    # Stream the new voice response
-                    async def stream_new():
-                        async for chunk in rime_client.stream_synthesize(reconciled_text, interruption_mgr.current_turn.cancel_event):
-                            if chunk.get("cancelled"):
-                                break
-                            b64 = base64.b64encode(chunk["audio_pcm"]).decode("ascii") if chunk["audio_pcm"] else ""
-                            await websocket.send_json({
-                                "type": "audio_chunk",
-                                "chunk_index": chunk["chunk_index"],
-                                "audio_base64": b64,
-                                "is_final": chunk["is_final"],
-                                "text": reconciled_text if chunk["chunk_index"] == 0 else ""
-                            })
-                    active_stream_task = asyncio.create_task(stream_new())
+                    new_turn = interruption_mgr.create_turn(new_input)
+                    state_mgr.add_user_message(new_input, new_turn.turn_id)
+
+                    await websocket.send_json({"type": "thinking"})
+                    reconciled_text = await generate_ai_response(
+                        new_input,
+                        constraints=state_mgr.active_constraints,
+                        dialogue_history=state_mgr.get_context_for_llm(),
+                        cancellation_event=new_turn.cancel_event
+                    )
+                    if reconciled_text:
+                        state_mgr.add_assistant_message(reconciled_text, new_turn.turn_id) if hasattr(state_mgr, 'add_assistant_message') else None
+                        active_stream_task = asyncio.create_task(
+                            stream_tts_to_ws(reconciled_text, new_turn.cancel_event, is_barge_in=True)
+                        )
 
             elif msg_type == "user_speech":
                 query = data.get("query", "")
+                if not query:
+                    continue
+
                 turn = interruption_mgr.create_turn(query)
                 interruption_mgr.mark_speech_end(turn)
                 state_mgr.add_user_message(query, turn.turn_id)
-                
+
+                # Notify frontend we are processing
+                await websocket.send_json({"type": "thinking"})
+
                 # Check if this query needs a delayed tool
                 delay_tool = data.get("delay_tool", False)
                 if delay_tool:
@@ -391,8 +545,11 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                         query_equipment_database(query, delay_seconds=3.0, cancellation_event=turn.cancel_event)
                     )
                     interruption_mgr.register_task(turn, tool_task)
-                    tool_result = await tool_task
-                    
+                    try:
+                        tool_result = await tool_task
+                    except asyncio.CancelledError:
+                        tool_result = {"cancelled": True}
+
                     if tool_result.get("cancelled"):
                         await websocket.send_json({
                             "type": "tool_discarded",
@@ -400,33 +557,29 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                         })
                         continue
 
-                response_text = generate_llm_response(query, state_mgr.active_constraints)
+                response_text = await generate_ai_response(
+                    query,
+                    constraints=state_mgr.active_constraints,
+                    dialogue_history=state_mgr.get_context_for_llm(),
+                    cancellation_event=turn.cancel_event
+                )
                 interruption_mgr.mark_first_audio_byte(turn)
-                
-                # Stream Rime synthesized audio chunks to frontend
-                async def stream_audio():
-                    async for chunk in rime_client.stream_synthesize(response_text, turn.cancel_event):
-                        if chunk.get("cancelled"):
-                            await websocket.send_json({
-                                "type": "cancel_audio",
-                                "reason": "barge_in_mid_stream",
-                                "discarded_chunk": chunk["chunk_index"]
-                            })
-                            break
-                        b64 = base64.b64encode(chunk["audio_pcm"]).decode("ascii") if chunk["audio_pcm"] else ""
-                        await websocket.send_json({
-                            "type": "audio_chunk",
-                            "chunk_index": chunk["chunk_index"],
-                            "audio_base64": b64,
-                            "is_final": chunk["is_final"],
-                            "text": response_text if chunk["chunk_index"] == 0 else ""
-                        })
-                active_stream_task = asyncio.create_task(stream_audio())
+
+                if not response_text:
+                    logger.warning("Empty response text — skipping TTS")
+                    continue
+
+                # Launch TTS streaming as independent task (not tied to mic state)
+                active_stream_task = asyncio.create_task(
+                    stream_tts_to_ws(response_text, turn.cancel_event)
+                )
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
+        if active_stream_task and not active_stream_task.done():
+            active_stream_task.cancel()
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}", exc_info=True)
 
 
 # Mount frontend static files

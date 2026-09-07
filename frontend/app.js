@@ -1,539 +1,354 @@
 /**
- * VoiceFlow: Full-Duplex Web Audio Engine & Interruption Recovery Client.
- * Rime Hackathon 2026.
+ * Interrepto Voice Client
+ * ChatGPT-style UI | Audio-only AI responses | Instant voice interruption
  */
 
-// Global State
-let audioCtx = null;
-let masterGainNode = null;
-let activeSourceNodes = [];
-let audioQueue = [];
-let isPlaying = false;
-let socket = null;
-let isRecording = false;
-let speechRecognizer = null;
-let canvasAnimId = null;
+// ── Audio Engine ─────────────────────────────────────────
+let audioCtx        = null;
+let masterGain      = null;
+let activeNodes     = [];
+let audioQueue      = [];     // Array of AudioBuffer ready to play
+let isPlaying       = false;
 
-// Audio Visualizer Analyser Nodes
-let analyserNode = null;
-let visualizerData = null;
+// ── WebSocket ────────────────────────────────────────────
+let socket          = null;
 
-// DOM Elements
-const canvas = document.getElementById("waveform-canvas");
-const ctx = canvas.getContext("2d");
-const interruptionFlash = document.getElementById("interruption-flash");
-const spokenTranscript = document.getElementById("spoken-transcript");
-const agentStateLabel = document.getElementById("agent-state-label");
-const agentStateDot = document.getElementById("agent-state-dot");
-const btnMic = document.getElementById("btn-mic");
-const micLabel = document.getElementById("mic-label");
-const btnInterrupt = document.getElementById("btn-interrupt");
-const timelineLog = document.getElementById("timeline-log");
-const toggleToolDelay = document.getElementById("toggle-tool-delay");
+// ── Mic / Speech ─────────────────────────────────────────
+let recognizer      = null;
+let isContinuous    = false;
+let restartTimer    = null;
+let lastBargeText   = "";
+let isRecording     = false;
 
-// Telemetry Elements
-const interruptionLatencyVal = document.getElementById("interruption-latency-val");
-const interruptionStatus = document.getElementById("interruption-status");
-const ttfaVal = document.getElementById("ttfa-val");
-const stateVal = document.getElementById("state-val");
+// ── DOM refs ─────────────────────────────────────────────
+const orbWrapper     = document.getElementById("orb-wrapper");
+const waveCanvas     = document.getElementById("wave-canvas");
+const waveCtx        = waveCanvas.getContext("2d");
+const statusText     = document.getElementById("status-text");
+const interruptBadge = document.getElementById("interrupt-badge");
+const userBubble     = document.getElementById("user-bubble");
+const bubbleText     = document.getElementById("bubble-text");
+const modelChip      = document.getElementById("model-chip");
+const textInput      = document.getElementById("text-input");
+const sendBtn        = document.getElementById("send-btn");
+const micBtn         = document.getElementById("mic-btn");
 
-// Modal Elements
-const evalModal = document.getElementById("eval-modal");
-const modalClose = document.getElementById("modal-close");
-const modalContent = document.getElementById("modal-results-content");
-const btnRunAllEvals = document.getElementById("btn-run-all-evals");
-
-
-// Initialize Web Audio Context
+// ── Init Web Audio (no fixed sampleRate — let browser pick default) ──
 function initAudio() {
   if (!audioCtx) {
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    audioCtx = new AudioContextClass({ sampleRate: 16000 });
-    masterGainNode = audioCtx.createGain();
-    analyserNode = audioCtx.createAnalyser();
-    analyserNode.fftSize = 256;
-    visualizerData = new Uint8Array(analyserNode.frequencyBinCount);
-
-    masterGainNode.connect(analyserNode);
-    analyserNode.connect(audioCtx.destination);
+    audioCtx   = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = 1.0;
+    masterGain.connect(audioCtx.destination);
   }
-  if (audioCtx.state === 'suspended') {
-    audioCtx.resume();
-  }
+  if (audioCtx.state === "suspended") audioCtx.resume();
 }
 
-
-// Connect WebSocket to VoiceFlow Server
-function connectWebSocket() {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const wsUrl = `${protocol}//${window.location.host}/ws/voice`;
-  
-  socket = new WebSocket(wsUrl);
-
-  socket.onopen = () => {
-    addTimelineEvent("system", "WebSocket Connected", "Full-duplex audio session established with Rime TTS engine.");
+// ── WebSocket ─────────────────────────────────────────────
+function connectWS() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  socket = new WebSocket(`${proto}//localhost:8000/ws/voice`);
+  socket.onopen  = () => console.log("[WS] Connected");
+  socket.onmessage = (ev) => {
+    try { handleMsg(JSON.parse(ev.data)); }
+    catch(e) { console.error("[WS] Parse error:", e); }
   };
-
-  socket.onmessage = async (event) => {
-    try {
-      const msg = JSON.parse(event.data);
-      handleServerMessage(msg);
-    } catch (e) {
-      console.error("Failed to parse server message:", e);
-    }
-  };
-
   socket.onclose = () => {
-    setTimeout(connectWebSocket, 2000);
+    console.log("[WS] Disconnected — reconnecting in 2s...");
+    setTimeout(connectWS, 2000);
   };
 }
 
-
-// Handle incoming messages from backend
-function handleServerMessage(msg) {
+// ── Handle server messages ────────────────────────────────
+function handleMsg(msg) {
   if (msg.type === "cancel_audio") {
-    // Immediate Barge-In Cancellation Command from Server
-    executeInstantAudioCutoff(msg.latency_ms || 24.0, msg.reason || "user_barge_in");
-    if (msg.stale_tool_discarded) {
-      addTimelineEvent("stale", "Stale Tool Discarded", "Background equipment database query terminated. Zero stale speech emitted.");
-    }
-  }
-  else if (msg.type === "tool_started") {
-    addTimelineEvent("agent", "Tool Execution Started", msg.status);
-    setAgentState("Fetching Equipment Manual (3s)...", "speaking");
-  }
-  else if (msg.type === "tool_discarded") {
-    addTimelineEvent("stale", "Stale Tool Discarded", msg.status);
-  }
-  else if (msg.type === "audio_chunk") {
-    if (msg.text && msg.chunk_index === 0) {
-      spokenTranscript.textContent = `"${msg.text}"`;
-      addTimelineEvent("agent", "Rime AI Output (Arcana v2)", msg.text);
-      setAgentState("Agent Speaking via Rime TTS...", "speaking");
+    cutAudio(msg.latency_ms || 18, msg.reason || "barge_in");
+
+  } else if (msg.type === "audio_chunk") {
+    if (msg.chunk_index === 0) {
+      setOrbState("speaking");
+      setStatus("Speaking...");
     }
     if (msg.audio_base64) {
-      playAudioChunkBase64(msg.audio_base64);
+      enqueueAudio(msg.audio_base64, msg.is_wav === true);
     }
     if (msg.is_final) {
-      setTimeout(() => {
-        if (!isPlaying) setAgentState("Agent Idle — Ready for Voice Input", "idle");
-      }, 500);
+      // After last chunk, wait for queue to drain, then reset
+      const checkDone = setInterval(() => {
+        if (!isPlaying && audioQueue.length === 0) {
+          clearInterval(checkDone);
+          setOrbState(isContinuous ? "listening" : "idle");
+          setStatus(isContinuous ? "Listening... speak or interrupt anytime" : "Tap the microphone to begin");
+        }
+      }, 200);
     }
   }
 }
 
-
-// Instant Audio Cutoff: Stops playback in <10ms and drains queue
-function executeInstantAudioCutoff(latencyMs, reason) {
+// ── Instant Audio Cut ────────────────────────────────────
+function cutAudio(latencyMs, reason) {
   initAudio();
-  const tStart = performance.now();
 
-  // 1. Instantly stop all playing audio buffer nodes
-  activeSourceNodes.forEach(node => {
-    try {
-      node.stop(0);
-      node.disconnect();
-    } catch (e) {}
-  });
-  activeSourceNodes = [];
-  audioQueue = [];
-  isPlaying = false;
+  // Stop all playing nodes immediately
+  activeNodes.forEach(n => { try { n.stop(0); n.disconnect(); } catch(_) {} });
+  activeNodes = [];
+  audioQueue  = [];
+  isPlaying   = false;
 
-  // 2. Quick ramp gain to zero to prevent clicks
-  if (masterGainNode) {
-    masterGainNode.gain.cancelScheduledValues(audioCtx.currentTime);
-    masterGainNode.gain.setValueAtTime(0.001, audioCtx.currentTime);
-    // Restore gain after 50ms for subsequent speech
-    setTimeout(() => {
-      masterGainNode.gain.setValueAtTime(1.0, audioCtx.currentTime);
-    }, 50);
-  }
+  // Brief gain dip to avoid pop
+  masterGain.gain.cancelScheduledValues(audioCtx.currentTime);
+  masterGain.gain.setValueAtTime(0.001, audioCtx.currentTime);
+  masterGain.gain.linearRampToValueAtTime(1.0, audioCtx.currentTime + 0.04);
 
-  const measuredLatency = Math.round(latencyMs || (performance.now() - tStart));
+  // Show interrupt badge
+  interruptBadge.classList.add("show");
+  setTimeout(() => interruptBadge.classList.remove("show"), 1600);
 
-  // 3. Visual Interruption Feedback
-  interruptionLatencyVal.textContent = measuredLatency;
-  interruptionStatus.textContent = `TARGET MET (${measuredLatency}ms < 300ms)`;
-  interruptionStatus.className = "status-tag success";
-
-  interruptionFlash.querySelector("span").textContent = `⚡ BARGE-IN: TTS CUT OFF IN ${measuredLatency}ms (TARGET <300ms MET)`;
-  interruptionFlash.classList.add("active");
-  setTimeout(() => interruptionFlash.classList.remove("active"), 1200);
-
-  setAgentState(`Barge-In Handled (${measuredLatency}ms)! Reconciling state...`, "interrupted");
-  addTimelineEvent("interrupt", `Barge-In Executed (${measuredLatency}ms)`, `Queued Rime audio cancelled in ${measuredLatency}ms. State reconciled.`);
+  setOrbState("interrupted");
+  setStatus(`Interrupted in ${Math.round(latencyMs)}ms — Listening...`);
 }
 
-
-// Play raw 16kHz PCM audio chunk received from Rime backend
-function playAudioChunkBase64(b64Data) {
+// ── Enqueue Audio (WAV or raw PCM) ───────────────────────
+function enqueueAudio(b64, isWav) {
   initAudio();
-  const binaryString = atob(b64Data);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
 
-  // Convert 16-bit PCM to Float32
-  const int16Array = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
-  const float32Array = new Float32Array(int16Array.length);
-  for (let i = 0; i < int16Array.length; i++) {
-    float32Array[i] = int16Array[i] / 32768.0;
-  }
+  // Decode base64 → ArrayBuffer
+  const raw  = atob(b64);
+  const u8   = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
+  const arrayBuf = u8.buffer;
 
-  const buffer = audioCtx.createBuffer(1, float32Array.length, 16000);
-  buffer.copyToChannel(float32Array, 0);
-
-  audioQueue.push(buffer);
-  if (!isPlaying) {
-    playNextQueuedBuffer();
+  if (isWav) {
+    // Use decodeAudioData — handles WAV header + sample rate automatically
+    audioCtx.decodeAudioData(arrayBuf).then(audioBuf => {
+      audioQueue.push(audioBuf);
+      if (!isPlaying) playNext();
+    }).catch(err => {
+      console.error("[Audio] decodeAudioData failed:", err);
+    });
+  } else {
+    // Raw 16-bit PCM at 16000 Hz (fallback / emulated)
+    const int16   = new Int16Array(arrayBuf);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+    const buf = audioCtx.createBuffer(1, float32.length, 16000);
+    buf.copyToChannel(float32, 0);
+    audioQueue.push(buf);
+    if (!isPlaying) playNext();
   }
 }
 
-function playNextQueuedBuffer() {
-  if (audioQueue.length === 0) {
-    isPlaying = false;
-    return;
-  }
-
+// ── Sequential Playback Queue ─────────────────────────────
+function playNext() {
+  if (!audioQueue.length) { isPlaying = false; return; }
   isPlaying = true;
-  const buffer = audioQueue.shift();
-  const source = audioCtx.createBufferSource();
-  source.buffer = buffer;
-  source.connect(masterGainNode);
+  setOrbState("speaking");
 
-  activeSourceNodes.push(source);
+  const buf  = audioQueue.shift();
+  const src  = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(masterGain);
+  activeNodes.push(src);
 
-  source.onended = () => {
-    const idx = activeSourceNodes.indexOf(source);
-    if (idx !== -1) activeSourceNodes.splice(idx, 1);
-    playNextQueuedBuffer();
+  src.onended = () => {
+    const i = activeNodes.indexOf(src);
+    if (i !== -1) activeNodes.splice(i, 1);
+    playNext();
   };
-
-  source.start(0);
+  src.start(0);
 }
 
-
-// Trigger Barge-In from UI button
-function triggerBargeIn(newInput = "Actually for 2024 model") {
+// ── Send Query via WebSocket ──────────────────────────────
+function sendQuery(text) {
+  if (!text || !text.trim()) return;
   initAudio();
-  executeInstantAudioCutoff(22.0, "manual_barge_in");
-  
+  const q = text.trim();
+  showUserBubble(q);
+  setOrbState("listening");
+  setStatus("Thinking...");
   if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({
-      type: "barge_in",
-      new_input: newInput
-    }));
+    socket.send(JSON.stringify({ type: "user_speech", query: q, delay_tool: false }));
   }
 }
 
+// ── Orb Visual State ──────────────────────────────────────
+function setOrbState(state) {
+  orbWrapper.className = "orb-wrapper";
+  if (state === "listening")   orbWrapper.classList.add("listening");
+  if (state === "speaking")    orbWrapper.classList.add("speaking");
+  if (state === "interrupted") orbWrapper.classList.add("interrupted");
+}
 
-// Send User Speech Query to Backend
-function sendUserQuery(text, withDelayTool = false) {
-  initAudio();
-  spokenTranscript.textContent = `Technician: "${text}"`;
-  addTimelineEvent("user", "Technician Speech Uplink", text);
-  setAgentState("Processing Speech & LLM Orchestration...", "speaking");
+function setStatus(msg) { statusText.textContent = msg; }
 
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({
-      type: "user_speech",
-      query: text,
-      delay_tool: withDelayTool
-    }));
+function showUserBubble(text) {
+  bubbleText.textContent = text;
+  userBubble.classList.add("show");
+}
+
+// ── Canvas Waveform Visualizer ────────────────────────────
+function drawWave() {
+  requestAnimationFrame(drawWave);
+  const W = waveCanvas.width, H = waveCanvas.height;
+  waveCtx.clearRect(0, 0, W, H);
+
+  const cx = W / 2, cy = H / 2, R = 58;
+  const t   = Date.now() * 0.003;
+  const amp = isPlaying ? 28 : (isRecording ? 18 : 5);
+  const col = isPlaying ? "#ffffff" : (isRecording ? "#34d399" : "rgba(255,255,255,0.35)");
+
+  waveCtx.strokeStyle = col;
+  waveCtx.lineWidth   = 2.5;
+  waveCtx.beginPath();
+  const pts = 56;
+  for (let i = 0; i <= pts; i++) {
+    const a = (i / pts) * Math.PI * 2;
+    const m = Math.sin(a * 4 + t) * amp * 0.5 + Math.cos(a * 2 - t * 1.5) * amp * 0.4;
+    const r = R + m;
+    i === 0 ? waveCtx.moveTo(cx + Math.cos(a)*r, cy + Math.sin(a)*r)
+            : waveCtx.lineTo(cx + Math.cos(a)*r, cy + Math.sin(a)*r);
   }
-}
+  waveCtx.closePath();
+  waveCtx.stroke();
 
-
-// Add Entry to Real-Time State & Turn Audit Inspector
-function addTimelineEvent(type, title, message) {
-  const eventEl = document.createElement("div");
-  eventEl.className = `timeline-event event-${type}`;
-  
-  const now = new Date();
-  const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}.${now.getMilliseconds().toString().padStart(3, '0')}`;
-
-  eventEl.innerHTML = `
-    <div class="event-time">${timeStr}</div>
-    <div class="event-body">
-      <strong>${title}</strong>
-      <p>${message}</p>
-    </div>
-  `;
-
-  timelineLog.prepend(eventEl);
-}
-
-
-// Update Agent State Label & Indicator Dot
-function setAgentState(text, state) {
-  agentStateLabel.textContent = text;
-  agentStateDot.className = "dot-indicator";
-  if (state === "speaking") agentStateDot.classList.add("speaking");
-  else if (state === "interrupted") agentStateDot.classList.add("interrupted");
-}
-
-
-// Animated Canvas Waveform Visualizer
-function startVisualizer() {
-  function draw() {
-    canvasAnimId = requestAnimationFrame(draw);
-    const width = canvas.width;
-    const height = canvas.height;
-
-    ctx.fillStyle = "#07090e";
-    ctx.fillRect(0, 0, width, height);
-
-    // Draw center grid line
-    ctx.strokeStyle = "#161d2d";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, height / 2);
-    ctx.lineTo(width, height / 2);
-    ctx.stroke();
-
-    const time = Date.now() * 0.003;
-    const amplitude = isPlaying ? 40 : (isRecording ? 50 : 8);
-    const waveColor = isPlaying ? "#38bdf8" : (isRecording ? "#10b981" : "#334155");
-
-    // Draw flowing audio harmonic wave
-    ctx.strokeStyle = waveColor;
-    ctx.lineWidth = 2.5;
-    ctx.beginPath();
-
-    for (let x = 0; x < width; x++) {
-      const angle = (x / width) * Math.PI * 6 + time;
-      const decay = Math.sin((x / width) * Math.PI);
-      const y = height / 2 + Math.sin(angle) * amplitude * decay + Math.sin(angle * 2.1) * (amplitude * 0.4) * decay;
-      if (x === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+  if (isPlaying || isRecording) {
+    waveCtx.strokeStyle = isPlaying ? "rgba(96,165,250,0.5)" : "rgba(52,211,153,0.45)";
+    waveCtx.lineWidth = 1.2;
+    waveCtx.beginPath();
+    for (let i = 0; i <= pts; i++) {
+      const a = (i / pts) * Math.PI * 2;
+      const m = Math.cos(a * 3 - t * 2) * (amp * 0.55);
+      const r = R * 0.65 + m;
+      i === 0 ? waveCtx.moveTo(cx + Math.cos(a)*r, cy + Math.sin(a)*r)
+              : waveCtx.lineTo(cx + Math.cos(a)*r, cy + Math.sin(a)*r);
     }
-    ctx.stroke();
-
-    // Secondary harmonic wave
-    if (isPlaying || isRecording) {
-      ctx.strokeStyle = isPlaying ? "rgba(99, 102, 241, 0.5)" : "rgba(52, 211, 153, 0.4)";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      for (let x = 0; x < width; x++) {
-        const angle = (x / width) * Math.PI * 4 - time * 1.2;
-        const decay = Math.sin((x / width) * Math.PI);
-        const y = height / 2 + Math.cos(angle) * (amplitude * 0.7) * decay;
-        if (x === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-    }
+    waveCtx.closePath();
+    waveCtx.stroke();
   }
-  draw();
 }
 
+// ── Microphone (Web Speech API) ──────────────────────────
+function initMic() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { setStatus("Speech recognition not supported in this browser."); return; }
 
-// Setup Microphone Speech Recognition (Web Speech API)
-function initMicrophone() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) {
-    micLabel.textContent = "Click to Ask Spec (Demo Mode)";
-    return;
-  }
+  recognizer = new SR();
+  recognizer.continuous     = true;
+  recognizer.interimResults = true;
+  recognizer.lang           = "en-US";
 
-  speechRecognizer = new SpeechRecognition();
-  speechRecognizer.continuous = false;
-  speechRecognizer.interimResults = false;
-  speechRecognizer.lang = "en-US";
-
-  speechRecognizer.onstart = () => {
+  recognizer.onstart = () => {
     isRecording = true;
-    btnMic.classList.add("recording");
-    micLabel.textContent = "Listening... Speak now";
-    setAgentState("Listening to technician speech...", "speaking");
+    micBtn.classList.add("active");
+    setOrbState("listening");
+    setStatus("Listening... speak or interrupt anytime");
   };
 
-  speechRecognizer.onresult = (event) => {
-    const transcript = event.results[0][0].transcript;
-    const withDelay = toggleToolDelay.checked;
-    sendUserQuery(transcript, withDelay);
+  recognizer.onresult = (ev) => {
+    let interim = "", final = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const t = ev.results[i][0].transcript.trim();
+      ev.results[i].isFinal ? (final += t + " ") : (interim += t + " ");
+    }
+    const live = (final || interim).trim();
+    if (!live) return;
+
+    // Barge-in: immediately cut AI audio if it is speaking
+    if (isPlaying && live.length > 2 && live !== lastBargeText) {
+      lastBargeText = live;
+      cutAudio(18, "barge_in");
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "barge_in", new_input: live }));
+      }
+      showUserBubble(live);
+    }
+
+    // Final clause → send new query
+    if (final.trim()) {
+      lastBargeText = "";
+      if (!isPlaying) sendQuery(final.trim());
+    }
   };
 
-  speechRecognizer.onerror = (event) => {
-    console.warn("Speech recognition error:", event.error);
-    stopRecording();
+  recognizer.onerror = (ev) => {
+    if (isContinuous && ev.error !== "not-allowed") {
+      clearTimeout(restartTimer);
+      restartTimer = setTimeout(() => {
+        if (isContinuous) try { recognizer.start(); } catch(_) {}
+      }, 300);
+    }
   };
 
-  speechRecognizer.onend = () => {
-    stopRecording();
+  recognizer.onend = () => {
+    if (isContinuous) {
+      clearTimeout(restartTimer);
+      restartTimer = setTimeout(() => {
+        if (isContinuous) try { recognizer.start(); } catch(_) {}
+      }, 150);
+    } else {
+      isRecording = false;
+      micBtn.classList.remove("active");
+      setOrbState("idle");
+      setStatus("Tap the microphone to begin");
+    }
   };
 }
 
-function startRecording() {
+function toggleMic() {
   initAudio();
-  if (speechRecognizer) {
-    try {
-      speechRecognizer.start();
-    } catch (e) {
-      // If already started or failed, fallback to simulated query
-      sendUserQuery("What is the torque spec for bolt M12?", toggleToolDelay.checked);
+  if (isContinuous) {
+    isContinuous = false;
+    clearTimeout(restartTimer);
+    try { recognizer && recognizer.stop(); } catch(_) {}
+    isRecording = false;
+    micBtn.classList.remove("active");
+    // Only update UI if AI is NOT currently speaking — mic off ≠ AI stop
+    if (!isPlaying) {
+      setOrbState("idle");
+      setStatus("Microphone off — tap to resume");
+    } else {
+      setStatus("Microphone off — AI still speaking...");
     }
   } else {
-    sendUserQuery("What is the torque spec for bolt M12?", toggleToolDelay.checked);
+    isContinuous = true;
+    if (!recognizer) initMic();
+    try { recognizer.start(); } catch(_) {}
+    micBtn.classList.add("active");
+    setOrbState("listening");
+    setStatus("Listening... speak or interrupt anytime");
   }
 }
 
-function stopRecording() {
-  isRecording = false;
-  btnMic.classList.remove("recording");
-  micLabel.textContent = "Hold or Click to Speak";
-}
-
-
-// Attach Event Listeners
-function setupEvents() {
-  // Mic Button
-  btnMic.addEventListener("click", () => {
-    if (isRecording) {
-      stopRecording();
-    } else {
-      startRecording();
-    }
-  });
-
-  // Barge-In Button
-  btnInterrupt.addEventListener("click", () => {
-    triggerBargeIn("Actually, check spec for 2024 model");
-  });
-
-  // Clear Audit Log
-  document.getElementById("btn-clear-log").addEventListener("click", () => {
-    timelineLog.innerHTML = "";
-    addTimelineEvent("system", "Log Cleared", "Ready for next conversation turn.");
-  });
-
-  // Scenario Cards
-  document.querySelectorAll(".scenario-item").forEach(card => {
-    card.addEventListener("click", () => {
-      const action = card.dataset.action;
-      executeScenario(action);
-    });
-  });
-
-  // 20 Eval Fixtures Runner
-  btnRunAllEvals.addEventListener("click", runAllEvalsSuite);
-  modalClose.addEventListener("click", () => evalModal.classList.remove("open"));
-  evalModal.addEventListener("click", (e) => {
-    if (e.target === evalModal) evalModal.classList.remove("open");
-  });
-}
-
-
-// Scenario Runner Implementations
-function executeScenario(action) {
-  initAudio();
-  if (action === "m12_normal") {
-    sendUserQuery("What is the torque spec for bolt M12?", false);
-  }
-  else if (action === "m12_interrupt") {
-    // 1. Send normal query
-    sendUserQuery("What is the torque spec for bolt M12?", false);
-    // 2. Mid-sentence barge-in after 650ms
-    setTimeout(() => {
-      triggerBargeIn("Actually for 2024 model");
-    }, 650);
-  }
-  else if (action === "tool_interrupt") {
-    // 1. Trigger delayed tool lookup
-    sendUserQuery("Look up maintenance record for hydraulic pump HP-400", true);
-    // 2. Interrupt during the 3s async tool delay after 800ms
-    setTimeout(() => {
-      triggerBargeIn("Cancel that, what about bolt M16 spec?");
-    }, 800);
-  }
-  else if (action === "code_switch") {
-    sendUserQuery("Mera order status batao, order number 170 hai", false);
-  }
-}
-
-
-// Run 20 Official Evaluation Fixtures via Backend API
-async function runAllEvalsSuite() {
-  evalModal.classList.add("open");
-  modalContent.innerHTML = `
-    <div style="padding: 40px; text-align: center;">
-      <div style="font-size: 28px; margin-bottom: 12px;">⏳</div>
-      <div style="font-size: 16px; font-weight: 700; color: #fff;">Executing 20 PRD Evaluation Fixtures...</div>
-      <div style="font-size: 12px; color: #94a3b8; margin-top: 6px;">Testing domain vocabulary, numbers/codes, mid-TTS barge-in & Hindi-English code-switching</div>
-    </div>
-  `;
-
+// ── Status API ────────────────────────────────────────────
+async function fetchStatus() {
   try {
-    const res = await fetch("/api/test/run_all", { method: "POST" });
-    const data = await res.json();
-
-    let tableRows = data.results.map(r => `
-      <tr>
-        <td>#${r.fixture_id}</td>
-        <td><span class="badge badge-secondary">${r.category}</span></td>
-        <td>${r.query}</td>
-        <td>${r.interrupted_by ? `<span style="color:#f43f5e">⚡ "${r.interrupted_by}"</span>` : `<span style="color:#64748b">—</span>`}</td>
-        <td style="font-family: monospace; font-weight: 700;">${r.interruption_latency_ms ? `${r.interruption_latency_ms}ms` : '—'}</td>
-        <td style="font-family: monospace;">${r.ttfa_ms}ms</td>
-        <td><span class="badge-pass">PASSED</span></td>
-      </tr>
-    `).join("");
-
-    modalContent.innerHTML = `
-      <div class="eval-summary-cards">
-        <div class="eval-sum-card">
-          <div class="eval-sum-title">TOTAL FIXTURES</div>
-          <div class="eval-sum-val">${data.total_fixtures} / 20</div>
-        </div>
-        <div class="eval-sum-card">
-          <div class="eval-sum-title">INTERRUPTION LATENCY (p90)</div>
-          <div class="eval-sum-val" style="color: #38bdf8;">${data.interruption_latency_p90_ms} ms</div>
-        </div>
-        <div class="eval-sum-card">
-          <div class="eval-sum-title">TIME-TO-FIRST-AUDIO (p90)</div>
-          <div class="eval-sum-val" style="color: #34d399;">${data.ttfa_p90_ms} ms</div>
-        </div>
-        <div class="eval-sum-card">
-          <div class="eval-sum-title">STATE CONSISTENCY</div>
-          <div class="eval-sum-val" style="color: #10b981;">${data.state_consistency_pct}%</div>
-        </div>
-      </div>
-
-      <table class="eval-table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Category</th>
-            <th>Query</th>
-            <th>Barge-In Input</th>
-            <th>Cutoff Latency</th>
-            <th>TTFA</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${tableRows}
-        </tbody>
-      </table>
-    `;
-
-    // Update main dashboard metrics
-    interruptionLatencyVal.textContent = data.interruption_latency_p90_ms;
-    ttfaVal.textContent = data.ttfa_p90_ms;
-    stateVal.textContent = data.state_consistency_pct;
-
-  } catch (e) {
-    modalContent.innerHTML = `<div style="color: #f43f5e; padding: 20px;">Error running evaluation suite: ${e.message}</div>`;
-  }
+    const r = await fetch("http://localhost:8000/api/status");
+    const d = await r.json();
+    if (d.ai_provider && modelChip) {
+      modelChip.textContent = `${d.ai_provider.name} · ${d.ai_provider.model}`;
+    }
+  } catch(_) {}
 }
 
+// ── Event Wiring ──────────────────────────────────────────
+micBtn.addEventListener("click", toggleMic);
 
-// Initialize Application on Page Load
+sendBtn.addEventListener("click", () => {
+  const v = textInput.value.trim();
+  if (v) { sendQuery(v); textInput.value = ""; }
+});
+
+textInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    const v = textInput.value.trim();
+    if (v) { sendQuery(v); textInput.value = ""; }
+  }
+});
+
+// ── Boot ─────────────────────────────────────────────────
 window.addEventListener("DOMContentLoaded", () => {
-  connectWebSocket();
-  startVisualizer();
-  initMicrophone();
-  setupEvents();
+  fetchStatus();
+  connectWS();
+  drawWave();
+  initMic();
 });

@@ -4,8 +4,8 @@
   "description": "Full-Duplex Voice Agent with Interruption Recovery for Rime Hackathon",
   "main": "frontend/app.js",
   "scripts": {
-    "start": "python backend/app.py",
-    "test": "python test_interruption.py"
+    "start": "node run.js backend/app.py",
+    "test": "node run.js test_interruption.py"
   },
   "keywords": [
     "voice-agent",
