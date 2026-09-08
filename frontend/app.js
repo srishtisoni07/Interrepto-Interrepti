@@ -360,7 +360,7 @@ function toggleMic() {
 // ── Status API ────────────────────────────────────────────
 async function fetchStatus() {
   try {
-    const BACKEND_URL = "https://interrepto-interrepti.onrender.com/";
+    const BACKEND_URL = "https://interrepto-interrepti.onrender.com";
 
     const r = await fetch(`${BACKEND_URL}/api/status`);
     const d = await r.json();
