@@ -20,6 +20,7 @@ let recognizer      = null;
 let isContinuous    = false;
 let restartTimer    = null;
 let lastBargeText   = "";
+let audioGeneration =0;
 let isRecording     = false;
 
 // ── DOM refs ─────────────────────────────────────────────
@@ -118,6 +119,7 @@ function waitForPlaybackComplete() {
 
 // ── Instant Audio Cut ────────────────────────────────────
 function cutAudio(latencyMs, reason) {
+  audioGeneration++;
   initAudio();
 
   // Stop all playing nodes immediately
@@ -146,30 +148,47 @@ function cutAudio(latencyMs, reason) {
 function enqueueAudio(b64, isWav) {
   initAudio();
 
-  // Decode base64 → ArrayBuffer
-  const raw  = atob(b64);
-  const u8   = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
+  const generationAtDecode = audioGeneration;
+
+  const raw = atob(b64);
+  const u8 = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) {
+    u8[i] = raw.charCodeAt(i);
+  }
+
   const arrayBuf = u8.buffer;
 
   if (isWav) {
-    // Use decodeAudioData — handles WAV header + sample rate automatically
     audioCtx.decodeAudioData(arrayBuf.slice(0)).then(audioBuf => {
+
+      // OLD response ka audio discard karo
+      if (generationAtDecode !== audioGeneration) return;
+
       audioQueue.push(audioBuf);
+
       if (!isPlaying) playNext();
+
     }).catch(err => {
-      console.error("[Audio] decodeAudioData failed for chunk, skipping:", err.message);
-      // Skip failed chunk but continue playing remaining queue
-      if (!isPlaying && audioQueue.length) playNext();
+      console.error("[Audio] decodeAudioData failed:", err.message);
     });
+
   } else {
-    // Raw 16-bit PCM at 16000 Hz (fallback / emulated)
-    const int16   = new Int16Array(arrayBuf);
+    if (generationAtDecode !== audioGeneration) return;
+
+    const int16 = new Int16Array(arrayBuf);
     const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / 32768.0;
+    }
+
     const buf = audioCtx.createBuffer(1, float32.length, 16000);
     buf.copyToChannel(float32, 0);
+
+    if (generationAtDecode !== audioGeneration) return;
+
     audioQueue.push(buf);
+
     if (!isPlaying) playNext();
   }
 }
@@ -293,12 +312,25 @@ function initMic() {
     if (!live) return;
 
     // Barge-in: only when mic is ON and AI is speaking (intentional interrupt)
-    if (isContinuous && isRecording && isAiSpeaking && live.length > 2 && live !== lastBargeText) {
+    if (
+      isContinuous &&
+      isRecording &&
+      isAiSpeaking &&
+      live.length > 2 &&
+      live !== lastBargeText){
       lastBargeText = live;
+
+      console.log("[BARGE-IN]", live);
+
       cutAudio(18, "barge_in");
+
       if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "barge_in", new_input: live }));
+        socket.send(JSON.stringify({
+          type: "barge_in",
+          new_input: live
+        }));
       }
+
       showUserBubble(live);
     }
 
