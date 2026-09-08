@@ -360,15 +360,17 @@ function toggleMic() {
 // ── Status API ────────────────────────────────────────────
 async function fetchStatus() {
   try {
-    const host = location.hostname || "localhost";
-    const port ="8000";
-    const r = await fetch(`${location.protocol}//${host}:${port}/api/status`);
+    const BACKEND_URL = "https://interrepto-interrepti.onrender.com/";
+
+    const r = await fetch(`${BACKEND_URL}/api/status`);
     const d = await r.json();
+
     if (d.ai_provider && modelChip) {
       const live = d.ai_provider.live_api_connected ? "Live" : "Offline";
-      modelChip.textContent = `${d.ai_provider.name} · ${d.ai_provider.model} · ${live}`;
+      modelChip.textContent =
+        `${d.ai_provider.name} · ${d.ai_provider.model} · ${live}`;
     }
-  } catch(_) {}
+  } catch (_) {}
 }
 
 // ── Event Wiring ──────────────────────────────────────────
