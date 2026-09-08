@@ -1,142 +1,97 @@
-# VoiceFlow: Full-Duplex Voice Agent with Interruption Recovery
-### Rime Hackathon — "Hard Voice Engineering" Submission (25% Weight Category)
+# Interrepto-Interrepti
+Natural interruptions for AI voice agents (an additional feature to chat gpt).
 
-VoiceFlow is an open-source, full-duplex voice agent designed for hands-busy environments (field service technicians and bilingual customer support) that solves the **Barge-In Interruption & Recovery** challenge.
+## Purpose
+Most voice agents make you wait until they finish speaking before you can correct them. Interrepto-Interrepti lets you interrupt mid-sentence. The agent stops immediately, understands your correction, and responds without losing context.
+Example:
+- You: "What's the weather in Mum-"
+- Agent: (starts responding) "The weather in Mu-"
+- You: "Actually, Delhi."
+- Agent: (stops within 300ms) "For Delhi, it's 35 degrees."
+  
+## Importance
+Half-duplex conversations feel robotic. Full-duplex with proper barge-in handling is what separates a demo from something people actually want to use. We built this because waiting for a voice agent to finish a wrong answer is frustrating.
 
-When users interrupt mid-response, traditional voice bots fail catastrophically: they continue speaking queued audio, emit stale database results, and lose context. VoiceFlow guarantees:
-1. **Sub-300ms Audio Cut-Off**: Queued Rime TTS audio stops immediately upon user speech.
-2. **Stale Tool Discarding**: Async tool lookups are terminated in-flight, preventing outdated data from ever being spoken.
-3. **100% State Consistency**: Reconciles monotonic dialogue turns and answers the refined query immediately.
+## Working
+Three things need to happen when you interrupt:
+1. Detect it fast (under 100ms) - We use client-side voice activity detection and audio energy thresholding in the browser
+2. Stop the TTS (under 300ms) - Rime's streaming API lets us cancel mid-sentence and clear queued audio
+3. Reconcile state - Track what the user actually said versus what the agent started responding to, then regenerate
+The state manager is key here. Without it, you get agents that stop speaking but then read out stale tool results or ignore your correction.
 
----
+## Tech Stack
+- LiveKit Agents (version 1.7+) - Full-duplex audio, WebRTC, turn handling
+- Rime AI (Arcana model) - TTS, low latency, natural voices
+- AssemblyAI - STT
+- Groq - LLM (Llama-3.3-70B)
+- Python 3.10+ - Backend
+- Vanilla JS - Frontend (no framework needed)
 
-## 🏗️ Architecture Diagram
+## Quick start
 
-```
-                             [ Technician / User ]
-                                     │   ▲
-                       Microphone    │   │  Rime TTS Audio
-                      Audio Uplink   │   │  Downlink (16kHz)
-                                     ▼   │
-                           ┌─────────────────────┐
-                           │   Browser Client    │
-                           │  (Web Audio API +   │
-                           │ Gain Ramp <10ms)    │
-                           └──────────┬──────────┘
-                                      │  ▲
-                        Bi-directional│  │  Chunked PCM
-                            WebSocket │  │  Streaming
-                                      ▼  │
-                           ┌─────────────────────┐
-                           │   FastAPI Server    │
-                           └──────────┬──────────┘
-                                      │
-              ┌───────────────────────┼───────────────────────┐
-              ▼                       ▼                       ▼
-    ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-    │  STT & Turn Mgr  │    │  Interruption    │    │ Rime AI Client   │
-    │  (AssemblyAI /   │    │  Manager         │    │ Model: arcana    │
-    │   Deepgram)      │    │  - Cancel Token  │    │ Voice: astra     │
-    └──────────────────┘    │  - Discard Stale │    │ (Cloud / Stream) │
-                            └─────────┬────────┘    └──────────────────┘
-                                      │
-                                      ▼
-                            ┌──────────────────┐
-                            │ Async Field DB   │
-                            │ (3.0s Delay Tool │
-                            │  with Abort)     │
-                            └──────────────────┘
-```
-
----
-
-## 🎙️ Exact Rime Configuration
-
-VoiceFlow leverages Rime AI as its primary spoken output provider with the following production configuration:
-
-| Setting | Value | Rationale |
-| :--- | :--- | :--- |
-| **Model ID** | `arcana` (or `mist-v3`) | `arcana` enables natural Hindi-English bilingual code-switching; `mist-v3` delivers 40ms p90 ultra-low latency |
-| **Speaker / Voice** | `astra` (or `brisk`) | High-intelligibility, conversational industrial cadence |
-| **Primary Language** | `en-US` & `hi-IN` | Bilingual support for field technicians in India |
-| **Endpoint** | `https://api.rime.ai/v1/rime-tts` | Regional API endpoint |
-| **WebSocket Stream** | `wss://api.rime.ai/v1/ws` | Full-duplex streaming audio frames |
-| **Audio Format** | `wav` (16-bit PCM mono) | Uncompressed, sub-millisecond audio buffer scheduling |
-| **Sampling Rate** | `16000` Hz (16kHz) | Standard telephony and WebRTC audio rate |
-| **Prompting Strategy** | *Writing for the Ear* | Short sentences (<15 words), acoustic fillers ("um", "uh"), comma-based prosody |
-
----
-
-## 🚀 Quickstart & Setup
-
-### Prerequisites
-- Python 3.10+ (tested on Python 3.11)
-- Modern web browser (Chrome, Edge, Firefox)
-
-### 1. Clone & Configure Environment
+### Cloning and installing
 ```bash
-git clone https://github.com/your-username/voiceflow.git
-cd voiceflow
-copy .env.example .env
-```
-
-Edit `.env` if you wish to use live Rime API keys:
-```ini
-RIME_API_KEY=your_actual_key_here
-RIME_MODEL=arcana
-RIME_VOICE=astra
-```
-*(Note: If no API key is specified, VoiceFlow automatically activates its built-in zero-dependency high-fidelity streaming synthesizer, allowing immediate testing out of the box).*
-
-### 2. Install Dependencies
-```bash
+git clone [https://github.com/yourusername/interrepto-interrepti.git](https://github.com/yourusername/interrepto-interrepti.git)
+cd interrepto-interrepti
 pip install -r requirements.txt
 ```
 
-### 3. Run Automated Benchmark Suite
-```bash
-python test_interruption.py
+### Setting up environment
+Copy .env.example to .env and fill in your API keys:
+```env
+RIME_API_KEY=your_rime_api_key
+LIVEKIT_API_KEY=your_livekit_key
+LIVEKIT_URL=wss://your-project.livekit.cloud
+ASSEMBLYAI_API_KEY=your_assemblyai_key
+GROQ_API_KEY=your_groq_key
 ```
 
-### 4. Launch the Web Application
+### Run it
 ```bash
-python backend/app.py
+# Terminal 1: Backend
+python src/agent_worker.py
+
+# Terminal 2: Frontend
+cd src/web_demo
+python -m http.server 8000
 ```
-Open [http://localhost:8000](http://localhost:8000) in your browser.
+Open http://localhost:8000, click Start, and try interrupting the agent mid-sentence.
 
----
+## Testing
+Run the test suite:
+```bash
+python tests/test_suite.py
+```
 
-## 🧪 Acceptance Test Scenarios (PRD Validations)
+You should see:
+TTFA: 380ms - PASS
+Interruption latency: 245ms - PASS
+TTS cancellation: PASS
+State consistency: PASS
 
-The web dashboard includes interactive test cards mapping directly to PRD Section 4:
+If any test fails, check the logs. Usually it's an API key issue or the interruption threshold needs tuning.
 
-1. **Normal Flow (Happy Path)**:
-   - *Query*: "What is the torque spec for bolt M12?"
-   - *Response*: Spoken output confirms "85 newton meters" within <400ms TTFA.
-2. **Mid-Response Barge-In**:
-   - *Query*: "What is the torque spec for bolt M12?"
-   - *Interruption*: Technician interrupts with "Actually for 2024 model".
-   - *Verification*: Audio cuts off in **<300ms** (measured ~18.5ms), previous 85 Nm is discarded, and updated 92 Nm spec is spoken.
-3. **Interruption During Slow Tool Call**:
-   - *Query*: "Fetch manual for hydraulic pump HP-400" (triggers 3.0s async database lookup).
-   - *Interruption*: User interrupts with "Cancel that, check bolt M16".
-   - *Verification*: Background tool task is aborted, stale pump data is discarded, and technician hears zero stale speech.
-4. **Hindi-English Code-Switching**:
-   - *Query*: "Mera order status batao, order number 170 hai"
-   - *Verification*: Rime Arcana v2 maintains continuous voice identity across Hindi and English phrases.
+## Tuning interruption sensitivity
+If the agent interrupts on background noise or misses your interruptions, adjust these in src/interruption_handler.py:
+```python
+INTERRUPTION_CONFIG = {
+    "vad_threshold": 0.5,      # Lower = more sensitive
+    "rms_threshold": 0.3,      # Lower = more sensitive
+    "confirmation_frames": 3,  # Higher = fewer false positives
+}
+```
+Start with the defaults. If you're in a noisy environment, bump rms_threshold to 0.4. If it's missing interruptions, drop it to 0.2.
 
----
+## Limitations
+- Browser-only for now - No mobile app or telephony yet
+- English-only - Rime supports other languages, but we haven't tested code-switching thoroughly
+- Single user - This is a demo, not production-scale
 
-## 🛡️ Failure Behavior & Fallbacks
+## Future scope
+If you want to extend this:
+- Add real tools - Replace fake_equipment_lookup() in src/tools.py with actual API calls
+- Telephony - Plug into Twilio or LiveKit SIP for phone-based interruption testing
+- Multilingual - Test Rime's Hindi/Spanish voices and adjust prompting for code-switching
 
-- **Rime Cloud Disconnect**: Automatically degrades to local high-fidelity streaming harmonic synthesis, ensuring unbroken audio service during network drops.
-- **Audio Overrun**: The client Web Audio pipeline utilizes dedicated `AudioBufferSourceNode` tracking with instant `.stop(0)` and a 5ms logarithmic gain ramp to eliminate audio pops and clicks.
-- **STT Failure**: If speech input confidence is degraded, fallback prompts ("Sorry, I didn't catch that spec, could you repeat?") are synthesized.
-
----
-
-## 🔒 Security & Compliance
-
-- **No Committed Secrets**: `.env` is ignored via `.gitignore`; only placeholder templates exist in `.env.example`.
-- **Synthetic Data**: Equipment manuals and order numbers are completely synthetic.
-- **Zero Audio Bleed**: Discarded buffers are wiped from client RAM upon interruption.
+## License
+MIT. Use it, break it, fix it.
