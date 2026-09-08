@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Interrepto Voice Client
  * ChatGPT-style UI | Audio-only AI responses | Instant voice interruption
  */
@@ -9,6 +9,8 @@ let masterGain      = null;
 let activeNodes     = [];
 let audioQueue      = [];     // Array of AudioBuffer ready to play
 let isPlaying       = false;
+let isAiSpeaking    = false;  // Independent of mic state
+let pendingFinal    = false;  // Tracks whether we're waiting for audio to finish
 
 // ── WebSocket ────────────────────────────────────────────
 let socket          = null;
@@ -47,14 +49,17 @@ function initAudio() {
 // ── WebSocket ─────────────────────────────────────────────
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  socket = new WebSocket(`${proto}//localhost:8000/ws/voice`);
+  const host  = location.hostname || "localhost";
+  const port  ="8000";
+  socket = new WebSocket(`${proto}//${host}:${port}/ws/voice`);
   socket.onopen  = () => console.log("[WS] Connected");
   socket.onmessage = (ev) => {
     try { handleMsg(JSON.parse(ev.data)); }
     catch(e) { console.error("[WS] Parse error:", e); }
   };
-  socket.onclose = () => {
-    console.log("[WS] Disconnected — reconnecting in 2s...");
+  socket.onerror = (ev) => console.error("[WS] Error:", ev);
+  socket.onclose = (ev) => {
+    console.log(`[WS] Disconnected (code=${ev.code}) — reconnecting in 2s...`);
     setTimeout(connectWS, 2000);
   };
 }
@@ -62,10 +67,18 @@ function connectWS() {
 // ── Handle server messages ────────────────────────────────
 function handleMsg(msg) {
   if (msg.type === "cancel_audio") {
-    cutAudio(msg.latency_ms || 18, msg.reason || "barge_in");
+    // Only cut audio for intentional barge-in, not mic-off
+    if (msg.reason === "user_barge_in" || msg.reason === "barge_in_mid_stream") {
+      cutAudio(msg.latency_ms || 18, msg.reason || "barge_in");
+    }
+
+  } else if (msg.type === "thinking") {
+    setOrbState(isContinuous ? "listening" : "idle");
+    setStatus("Thinking...");
 
   } else if (msg.type === "audio_chunk") {
-    if (msg.chunk_index === 0) {
+    if (msg.chunk_index === 0 || (msg.audio_base64 && !isAiSpeaking)) {
+      isAiSpeaking = true;
       setOrbState("speaking");
       setStatus("Speaking...");
     }
@@ -73,16 +86,22 @@ function handleMsg(msg) {
       enqueueAudio(msg.audio_base64, msg.is_wav === true);
     }
     if (msg.is_final) {
-      // After last chunk, wait for queue to drain, then reset
-      const checkDone = setInterval(() => {
-        if (!isPlaying && audioQueue.length === 0) {
-          clearInterval(checkDone);
-          setOrbState(isContinuous ? "listening" : "idle");
-          setStatus(isContinuous ? "Listening... speak or interrupt anytime" : "Tap the microphone to begin");
-        }
-      }, 200);
+      pendingFinal = true;
+      waitForPlaybackComplete();
     }
   }
+}
+
+function waitForPlaybackComplete() {
+  const checkDone = setInterval(() => {
+    if (!isPlaying && audioQueue.length === 0 && pendingFinal) {
+      clearInterval(checkDone);
+      pendingFinal = false;
+      isAiSpeaking = false;
+      setOrbState(isContinuous ? "listening" : "idle");
+      setStatus(isContinuous ? "Listening... speak or interrupt anytime" : "Tap the microphone to begin");
+    }
+  }, 200);
 }
 
 // ── Instant Audio Cut ────────────────────────────────────
@@ -94,18 +113,21 @@ function cutAudio(latencyMs, reason) {
   activeNodes = [];
   audioQueue  = [];
   isPlaying   = false;
+  isAiSpeaking = false;
+  pendingFinal = false;
 
   // Brief gain dip to avoid pop
   masterGain.gain.cancelScheduledValues(audioCtx.currentTime);
   masterGain.gain.setValueAtTime(0.001, audioCtx.currentTime);
   masterGain.gain.linearRampToValueAtTime(1.0, audioCtx.currentTime + 0.04);
 
-  // Show interrupt badge
-  interruptBadge.classList.add("show");
-  setTimeout(() => interruptBadge.classList.remove("show"), 1600);
-
-  setOrbState("interrupted");
-  setStatus(`Interrupted in ${Math.round(latencyMs)}ms — Listening...`);
+  // Show interrupt badge only for intentional barge-in
+  if (reason === "user_barge_in" || reason === "barge_in") {
+    interruptBadge.classList.add("show");
+    setTimeout(() => interruptBadge.classList.remove("show"), 1600);
+    setOrbState("interrupted");
+    setStatus(`Interrupted in ${Math.round(latencyMs)}ms — Listening...`);
+  }
 }
 
 // ── Enqueue Audio (WAV or raw PCM) ───────────────────────
@@ -120,11 +142,13 @@ function enqueueAudio(b64, isWav) {
 
   if (isWav) {
     // Use decodeAudioData — handles WAV header + sample rate automatically
-    audioCtx.decodeAudioData(arrayBuf).then(audioBuf => {
+    audioCtx.decodeAudioData(arrayBuf.slice(0)).then(audioBuf => {
       audioQueue.push(audioBuf);
       if (!isPlaying) playNext();
     }).catch(err => {
-      console.error("[Audio] decodeAudioData failed:", err);
+      console.error("[Audio] decodeAudioData failed for chunk, skipping:", err.message);
+      // Skip failed chunk but continue playing remaining queue
+      if (!isPlaying && audioQueue.length) playNext();
     });
   } else {
     // Raw 16-bit PCM at 16000 Hz (fallback / emulated)
@@ -245,6 +269,9 @@ function initMic() {
   };
 
   recognizer.onresult = (ev) => {
+    // Ignore speech results when mic is not actively listening
+    if (!isContinuous || !isRecording) return;
+
     let interim = "", final = "";
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
       const t = ev.results[i][0].transcript.trim();
@@ -253,8 +280,8 @@ function initMic() {
     const live = (final || interim).trim();
     if (!live) return;
 
-    // Barge-in: immediately cut AI audio if it is speaking
-    if (isPlaying && live.length > 2 && live !== lastBargeText) {
+    // Barge-in: only when mic is ON and AI is speaking (intentional interrupt)
+    if (isContinuous && isRecording && isAiSpeaking && live.length > 2 && live !== lastBargeText) {
       lastBargeText = live;
       cutAudio(18, "barge_in");
       if (socket && socket.readyState === WebSocket.OPEN) {
@@ -263,10 +290,10 @@ function initMic() {
       showUserBubble(live);
     }
 
-    // Final clause → send new query
-    if (final.trim()) {
+    // Final clause → send new query (only when AI is NOT speaking)
+    if (final.trim() && !isAiSpeaking) {
       lastBargeText = "";
-      if (!isPlaying) sendQuery(final.trim());
+      sendQuery(final.trim());
     }
   };
 
@@ -297,17 +324,19 @@ function initMic() {
 function toggleMic() {
   initAudio();
   if (isContinuous) {
+    // Mic OFF — stop listening only, do NOT cancel AI response
     isContinuous = false;
     clearTimeout(restartTimer);
+    lastBargeText = "";
     try { recognizer && recognizer.stop(); } catch(_) {}
     isRecording = false;
     micBtn.classList.remove("active");
-    // Only update UI if AI is NOT currently speaking — mic off ≠ AI stop
-    if (!isPlaying) {
+    if (isAiSpeaking) {
+      // AI is still speaking — leave it alone
+      setStatus("Microphone off — AI still speaking...");
+    } else {
       setOrbState("idle");
       setStatus("Microphone off — tap to resume");
-    } else {
-      setStatus("Microphone off — AI still speaking...");
     }
   } else {
     isContinuous = true;
@@ -322,10 +351,13 @@ function toggleMic() {
 // ── Status API ────────────────────────────────────────────
 async function fetchStatus() {
   try {
-    const r = await fetch("http://localhost:8000/api/status");
+    const host = location.hostname || "localhost";
+    const port ="8000";
+    const r = await fetch(`${location.protocol}//${host}:${port}/api/status`);
     const d = await r.json();
     if (d.ai_provider && modelChip) {
-      modelChip.textContent = `${d.ai_provider.name} · ${d.ai_provider.model}`;
+      const live = d.ai_provider.live_api_connected ? "Live" : "Offline";
+      modelChip.textContent = `${d.ai_provider.name} · ${d.ai_provider.model} · ${live}`;
     }
   } catch(_) {}
 }

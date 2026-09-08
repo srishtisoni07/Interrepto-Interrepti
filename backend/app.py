@@ -87,6 +87,102 @@ async def generate_ai_response(
     )
 
 
+async def stream_ai_and_tts(
+    query: str,
+    websocket: WebSocket,
+    cancel_event: asyncio.Event,
+    constraints: Optional[Dict[str, Any]] = None,
+    dialogue_history: Optional[List[Dict[str, str]]] = None,
+    is_barge_in: bool = False
+) -> str:
+    """
+    Pipelines Gemini streaming → incremental TTS → WebSocket audio chunks.
+    Starts TTS as soon as the first speakable sentence is available.
+    Returns the full concatenated response text.
+    """
+    full_text_parts: List[str] = []
+    chunk_index = 0
+    sentence_queue: asyncio.Queue = asyncio.Queue()
+
+    async def tts_worker():
+        nonlocal chunk_index
+        while True:
+            sentence = await sentence_queue.get()
+            if sentence is None:
+                break
+            if cancel_event.is_set() or not sentence.strip():
+                sentence_queue.task_done()
+                continue
+            try:
+                async for chunk in rime_client.stream_synthesize(sentence, cancel_event):
+                    if chunk.get("cancelled"):
+                        if not is_barge_in:
+                            try:
+                                await websocket.send_json({
+                                    "type": "cancel_audio",
+                                    "reason": "barge_in_mid_stream",
+                                    "discarded_chunk": chunk.get("chunk_index", 0)
+                                })
+                            except Exception:
+                                pass
+                        sentence_queue.task_done()
+                        return
+                    try:
+                        b64 = base64.b64encode(chunk["audio_pcm"]).decode("ascii") if chunk.get("audio_pcm") else ""
+                        await websocket.send_json({
+                            "type": "audio_chunk",
+                            "chunk_index": chunk_index,
+                            "audio_base64": b64,
+                            "is_wav": chunk.get("is_wav", False),
+                            "is_final": False,
+                            "text": sentence if chunk_index == 0 else ""
+                        })
+                        chunk_index += 1
+                    except Exception as chunk_err:
+                        logger.error(f"Error sending audio chunk {chunk_index}: {chunk_err}")
+            except Exception as e:
+                logger.error(f"TTS worker error: {e}")
+            sentence_queue.task_done()
+
+    worker = asyncio.create_task(tts_worker())
+
+    try:
+        async for text_chunk in llm_client.stream_response(
+            query=query,
+            dialogue_history=dialogue_history,
+            constraints=constraints or state_mgr.active_constraints,
+            cancellation_event=cancel_event
+        ):
+            if cancel_event.is_set():
+                logger.info("AI/TTS pipeline cancelled")
+                break
+            full_text_parts.append(text_chunk)
+            await sentence_queue.put(text_chunk)
+
+        await sentence_queue.put(None)
+        await worker
+
+        if not cancel_event.is_set():
+            await websocket.send_json({
+                "type": "audio_chunk",
+                "chunk_index": chunk_index,
+                "audio_base64": "",
+                "is_wav": False,
+                "is_final": True,
+                "text": ""
+            })
+
+    except asyncio.CancelledError:
+        await sentence_queue.put(None)
+        worker.cancel()
+        raise
+    except Exception as e:
+        logger.error(f"stream_ai_and_tts pipeline error: {e}", exc_info=True)
+        await sentence_queue.put(None)
+
+    return " ".join(full_text_parts)
+
+
 def generate_llm_response(query: str, constraints: Dict[str, Any], interrupted: bool = False) -> str:
     """Synchronous fallback helper for backwards compatibility."""
     return llm_client.generate_fallback_response(query, constraints)
@@ -136,7 +232,8 @@ async def get_status():
         "ai_provider": {
             "name": llm_client.provider.upper(),
             "model": llm_client.model,
-            "live_api_connected": llm_client.is_live
+            "live_api_connected": llm_client.is_live,
+            "gemini_key_loaded": bool(os.getenv("GEMINI_API_KEY", "") and not os.getenv("GEMINI_API_KEY", "").startswith("your_"))
         },
         "target_metrics": {
             "interruption_latency_target_ms": 300.0,
@@ -431,6 +528,32 @@ async def run_all_eval_fixtures():
     })
 
 
+def _make_stream_done_callback(turn, label: str, mark_ttfa: bool = False):
+    """
+    Builds a done-callback for a fire-and-forget stream_ai_and_tts task.
+    Runs once the background stream finishes, is cancelled, or errors —
+    WITHOUT the WebSocket receive loop ever blocking on it. This is what lets
+    barge_in / user_speech messages keep arriving while a long response streams.
+    """
+    def _callback(task: asyncio.Task):
+        try:
+            if task.cancelled():
+                logger.info(f"[Turn #{turn.turn_id}] {label} stream task cancelled by barge-in")
+                return
+            exc = task.exception()
+            if exc:
+                logger.error(f"[Turn #{turn.turn_id}] {label} stream task failed: {exc}", exc_info=exc)
+                return
+            response_text = task.result()
+            if mark_ttfa:
+                interruption_mgr.mark_first_audio_byte(turn)
+            if response_text:
+                state_mgr.add_agent_message(response_text, turn.turn_id)
+        except Exception as cb_err:
+            logger.error(f"[Turn #{turn.turn_id}] Error in stream done-callback: {cb_err}", exc_info=True)
+    return _callback
+
+
 @app.websocket("/ws/voice")
 async def voice_websocket_endpoint(websocket: WebSocket):
     """
@@ -493,6 +616,7 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                 # Cancel any running stream task
                 if active_stream_task and not active_stream_task.done():
                     active_stream_task.cancel()
+                active_stream_task = None  # guard: prevent a stale/racing reference from being cancelled again
 
                 # Send immediate cancel command to frontend audio buffer
                 await websocket.send_json({
@@ -509,17 +633,22 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                     state_mgr.add_user_message(new_input, new_turn.turn_id)
 
                     await websocket.send_json({"type": "thinking"})
-                    reconciled_text = await generate_ai_response(
-                        new_input,
-                        constraints=state_mgr.active_constraints,
-                        dialogue_history=state_mgr.get_context_for_llm(),
-                        cancellation_event=new_turn.cancel_event
-                    )
-                    if reconciled_text:
-                        state_mgr.add_assistant_message(reconciled_text, new_turn.turn_id) if hasattr(state_mgr, 'add_assistant_message') else None
-                        active_stream_task = asyncio.create_task(
-                            stream_tts_to_ws(reconciled_text, new_turn.cancel_event, is_barge_in=True)
+                    active_stream_task = asyncio.create_task(
+                        stream_ai_and_tts(
+                            query=new_input,
+                            websocket=websocket,
+                            cancel_event=new_turn.cancel_event,
+                            dialogue_history=state_mgr.get_context_for_llm(),
+                            constraints=state_mgr.active_constraints,
+                            is_barge_in=True
                         )
+                    )
+                    interruption_mgr.register_task(new_turn, active_stream_task)
+                    active_stream_task.add_done_callback(
+                        _make_stream_done_callback(new_turn, "barge-in")
+                    )
+                    # Fire-and-forget: do NOT await here. Awaiting would block this
+                    # receive loop again, exactly like the bug we're fixing.
 
             elif msg_type == "user_speech":
                 query = data.get("query", "")
@@ -557,22 +686,24 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                         })
                         continue
 
-                response_text = await generate_ai_response(
-                    query,
-                    constraints=state_mgr.active_constraints,
-                    dialogue_history=state_mgr.get_context_for_llm(),
-                    cancellation_event=turn.cancel_event
-                )
-                interruption_mgr.mark_first_audio_byte(turn)
-
-                if not response_text:
-                    logger.warning("Empty response text — skipping TTS")
-                    continue
-
-                # Launch TTS streaming as independent task (not tied to mic state)
+                # Stream AI response + TTS pipeline (starts speaking before full LLM response)
                 active_stream_task = asyncio.create_task(
-                    stream_tts_to_ws(response_text, turn.cancel_event)
+                    stream_ai_and_tts(
+                        query=query,
+                        websocket=websocket,
+                        cancel_event=turn.cancel_event,
+                        dialogue_history=state_mgr.get_context_for_llm(),
+                        constraints=state_mgr.active_constraints
+                    )
                 )
+                interruption_mgr.register_task(turn, active_stream_task)
+                active_stream_task.add_done_callback(
+                    _make_stream_done_callback(turn, "user_speech", mark_ttfa=True)
+                )
+                # Fire-and-forget: do NOT await here. This is the core fix — awaiting
+                # blocked the receive loop for the whole stream duration, so barge_in
+                # messages sent during a long response never arrived. The done-callback
+                # above records the agent message once the background stream finishes.
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
@@ -585,6 +716,19 @@ async def voice_websocket_endpoint(websocket: WebSocket):
 # Mount frontend static files
 if os.path.exists(FRONTEND_DIR):
     app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+@app.get("/favicon.ico")
+async def favicon():
+    """Serve inline SVG favicon to prevent 404."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+        '<circle cx="16" cy="16" r="14" fill="#10a37f"/>'
+        '<path d="M16 8v8l5 5" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/>'
+        '</svg>'
+    )
+    from fastapi import Response
+    return Response(content=svg, media_type="image/svg+xml")
+
 
 @app.get("/")
 async def serve_index():

@@ -21,6 +21,135 @@ from backend.rime_client import RimeClient
 logging.basicConfig(level=logging.WARNING)
 
 
+# ============================================================================
+# LONG-RESPONSE REGRESSION TEST
+# Exercises the real backend.app.stream_ai_and_tts pipeline (the fixed code
+# path) with a fake WebSocket and a mocked long, multi-sentence LLM stream —
+# no live network / API key required.
+# ============================================================================
+
+class FakeWebSocket:
+    """Minimal stand-in for a starlette WebSocket — just records sent JSON."""
+    def __init__(self):
+        self.sent = []
+
+    async def send_json(self, data):
+        self.sent.append(data)
+
+
+LONG_RESPONSE_SENTENCES = [
+    "This is sentence number one of a long detailed answer.",
+    "This is sentence number two, continuing the explanation.",
+    "This is sentence number three, adding more detail.",
+    "This is sentence number four, still going strong.",
+    "This is sentence number five, nearly there.",
+    "This is sentence number six, the final sentence.",
+]
+
+
+async def _fake_long_stream_response(query, dialogue_history=None, constraints=None, cancellation_event=None):
+    """Simulates a long Gemini stream: several sentences arriving with real pacing."""
+    for sentence in LONG_RESPONSE_SENTENCES:
+        if cancellation_event and cancellation_event.is_set():
+            return
+        await asyncio.sleep(0.15)
+        yield sentence
+
+
+async def _fake_stream_synthesize(text, cancellation_event=None):
+    """Fast fake TTS: yields one chunk immediately, respecting cancellation."""
+    if cancellation_event and cancellation_event.is_set():
+        yield {"chunk_index": 0, "audio_pcm": b"", "is_final": True, "cancelled": True}
+        return
+    await asyncio.sleep(0.01)
+    yield {"chunk_index": 0, "audio_pcm": b"\x00\x00", "is_final": True, "cancelled": False}
+
+
+async def test_long_response_scenario():
+    """
+    Regression test for the "long questions get no response / stop prematurely" bug.
+    Verifies, against the real stream_ai_and_tts pipeline:
+      1. A long multi-sentence response streams and plays to completion.
+      2. Interrupting mid-stream cancels quickly and cleanly (no hang).
+      3. A fresh follow-up turn is NOT poisoned/blocked by the cancelled turn
+         (i.e. cancel_event is per-turn, not leaked across turns).
+
+    Note: this exercises stream_ai_and_tts directly. Confirming that the live
+    WebSocket receive loop stays responsive to barge_in during a long stream
+    (the app.py fire-and-forget fix) still requires the manual check described
+    in the verification plan, since that depends on a real WebSocket connection.
+    """
+    import backend.app as app_module
+
+    print("\n" + "=" * 78)
+    print(" LONG-RESPONSE REGRESSION TEST")
+    print("=" * 78)
+
+    original_stream_response = app_module.llm_client.stream_response
+    original_stream_synthesize = app_module.rime_client.stream_synthesize
+    app_module.llm_client.stream_response = _fake_long_stream_response
+    app_module.rime_client.stream_synthesize = _fake_stream_synthesize
+
+    interruption_mgr = InterruptionManager()
+
+    try:
+        # --- Case 1: long response completes fully, uninterrupted ---
+        ws1 = FakeWebSocket()
+        turn1 = interruption_mgr.create_turn("tell me something long")
+        result1 = await asyncio.wait_for(
+            app_module.stream_ai_and_tts(
+                query="tell me something long",
+                websocket=ws1,
+                cancel_event=turn1.cancel_event
+            ),
+            timeout=5.0
+        )
+        assert "sentence number six" in result1, "Long response was truncated / did not complete!"
+        assert any(m.get("type") == "audio_chunk" and m.get("is_final") for m in ws1.sent), \
+            "No final audio_chunk sent for a completed long response!"
+        print(" [PASS] Long response streams and plays to completion")
+
+        # --- Case 2: interrupting mid-stream cancels cleanly and quickly ---
+        ws2 = FakeWebSocket()
+        turn2 = interruption_mgr.create_turn("tell me something long again")
+        task2 = asyncio.create_task(
+            app_module.stream_ai_and_tts(
+                query="tell me something long again",
+                websocket=ws2,
+                cancel_event=turn2.cancel_event
+            )
+        )
+        await asyncio.sleep(0.35)  # let a couple of sentences stream first
+        interruption_mgr.handle_barge_in(new_input="never mind, stop")
+        result2 = await asyncio.wait_for(task2, timeout=2.0)  # must resolve quickly, never hang
+        assert "sentence number six" not in result2, "Stream was not actually cut short by interruption!"
+        print(" [PASS] Mid-stream interruption cancels cleanly without hanging")
+
+        # --- Case 3: follow-up turn gets a fresh, un-poisoned response ---
+        ws3 = FakeWebSocket()
+        turn3 = interruption_mgr.create_turn("ok tell me the long one properly this time")
+        assert not turn3.cancel_event.is_set(), \
+            "New turn's cancel_event was poisoned by the previous interruption!"
+        result3 = await asyncio.wait_for(
+            app_module.stream_ai_and_tts(
+                query="ok tell me the long one properly this time",
+                websocket=ws3,
+                cancel_event=turn3.cancel_event
+            ),
+            timeout=5.0
+        )
+        assert "sentence number six" in result3, "Follow-up request was blocked/poisoned by the cancelled stream!"
+        print(" [PASS] Follow-up query after interruption gets a fresh, complete response")
+
+    finally:
+        app_module.llm_client.stream_response = original_stream_response
+        app_module.rime_client.stream_synthesize = original_stream_synthesize
+
+    print("=" * 78)
+    print(" LONG-RESPONSE REGRESSION TEST: ALL CASES PASSED")
+    print("=" * 78 + "\n")
+
+
 async def run_benchmark_suite():
     print("=" * 78)
     print(" VoiceFlow: Interruption Recovery & Hard Voice Engineering Benchmark")
@@ -133,5 +262,10 @@ async def run_benchmark_suite():
     print("ALL 20 HACKATHON ACCEPTANCE CRITERIA SUCCESSFULLY VERIFIED.\n")
 
 
+async def run_all():
+    await run_benchmark_suite()
+    await test_long_response_scenario()
+
+
 if __name__ == "__main__":
-    asyncio.run(run_benchmark_suite())
+    asyncio.run(run_all())

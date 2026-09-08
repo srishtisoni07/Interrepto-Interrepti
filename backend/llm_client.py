@@ -6,13 +6,23 @@ rich conversational intelligence like ChatGPT, async cancellation on barge-in, a
 
 import os
 import json
+import re
 import time
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, AsyncGenerator
 import aiohttp
+from dotenv import load_dotenv
+
+# Ensure .env is loaded regardless of import order (app.py also loads it at startup)
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 
 logger = logging.getLogger("voiceflow.llm")
+
+# Fallback model chain — tried in order when primary model fails
+GEMINI_MODEL_FALLBACKS = ["gemini-2.5-flash", "gemini-3.1-flash-lite"]
+GROQ_MODEL_FALLBACKS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 
 # System Prompt for a general-purpose conversational voice AI assistant (ChatGPT-like)
 VOICE_SYSTEM_PROMPT = """You are VoiceFlow, an intelligent, helpful, and natural AI voice assistant like ChatGPT.
@@ -26,15 +36,13 @@ Strict Spoken Voice Guidelines:
 5. Handling Barge-in & Interruptions: If the user interrupts you or refines their previous query mid-conversation, smoothly transition to addressing their new input without repeating stale info.
 6. Multilingual: If the user speaks in Hindi, Hinglish, or any other language, seamlessly reply in that language.
 """
-
-
 class LLMClient:
     def __init__(
         self,
         provider: Optional[str] = None,
         model: Optional[str] = None,
         api_key: Optional[str] = None,
-        timeout_seconds: float = 15.0
+        timeout_seconds: float = 30.0
     ):
         self.provider = (provider or os.getenv("AI_PROVIDER", "gemini")).lower()
         self.timeout_seconds = timeout_seconds
@@ -58,7 +66,7 @@ class LLMClient:
             self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         elif self.provider == "groq":
             self.api_key = api_key or os.getenv("GROQ_API_KEY", self.groq_api_key)
-            self.model = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+            self.model = model or os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
         else:
             self.provider = "gemini"
             self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
@@ -67,7 +75,8 @@ class LLMClient:
         self.is_live = bool(self.api_key and not self.api_key.startswith("your_"))
         logger.info(
             f"Configured LLMClient: provider={self.provider}, model={self.model}, "
-            f"live_credentials={self.is_live}"
+            f"live_credentials={self.is_live}, "
+            f"GEMINI_API_KEY loaded={'true' if self.gemini_api_key and not self.gemini_api_key.startswith('your_') else 'false'}"
         )
 
     def update_config(self, provider: str, api_key: str, model: Optional[str] = None):
@@ -118,36 +127,182 @@ class LLMClient:
                 logger.info("LLM generation task was cancelled during barge-in.")
                 raise
             except Exception as e:
-                logger.warning(f"Live AI provider ({self.provider}) call failed: {e}. Trying Groq fallback...")
-                # Try Groq as a fast live fallback before dropping to local rules
+                logger.warning(f"Live AI provider ({self.provider}) call failed: {e}. Trying fallback providers...")
+                # Try Groq then OpenAI as fallbacks before dropping to local rules
+                fallbacks = []
                 if self.provider != "groq" and self.groq_api_key and not self.groq_api_key.startswith("your_"):
-                    try:
-                        groq_client = LLMClient.__new__(LLMClient)
-                        groq_client.provider = "groq"
-                        groq_client.api_key = self.groq_api_key
-                        groq_client.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-                        groq_client.timeout_seconds = self.timeout_seconds
-                        groq_client.is_live = True
-                        groq_client.gemini_api_key = self.gemini_api_key
-                        groq_client.openai_api_key = self.openai_api_key
-                        groq_client.groq_api_key = self.groq_api_key
-                        return await groq_client._call_groq(query, dialogue_history, constraints, cancellation_event)
-                    except Exception as e2:
-                        logger.warning(f"Groq fallback also failed: {e2}. Using local rules.")
+                    fallbacks.append("groq")
+                if self.provider != "openai" and self.openai_api_key and not self.openai_api_key.startswith("your_") and not self.openai_api_key.startswith("sk-proj-your"):
+                    fallbacks.append("openai")
 
-        # Local intelligent fallback
+                for fb_provider in fallbacks:
+                    try:
+                        if fb_provider == "groq":
+                            for groq_model in GROQ_MODEL_FALLBACKS:
+                                try:
+                                    fb_client = LLMClient.__new__(LLMClient)
+                                    fb_client.provider = "groq"
+                                    fb_client.api_key = self.groq_api_key
+                                    fb_client.model = groq_model
+                                    fb_client.timeout_seconds = self.timeout_seconds
+                                    fb_client.is_live = True
+                                    fb_client.gemini_api_key = self.gemini_api_key
+                                    fb_client.openai_api_key = self.openai_api_key
+                                    fb_client.groq_api_key = self.groq_api_key
+                                    result = await fb_client._call_groq(query, dialogue_history, constraints, cancellation_event)
+                                    logger.info(f"Groq fallback succeeded with model={groq_model}")
+                                    return result
+                                except Exception as e2:
+                                    logger.warning(f"Groq fallback model {groq_model} failed: {e2}")
+                        elif fb_provider == "openai":
+                            fb_client = LLMClient.__new__(LLMClient)
+                            fb_client.provider = "openai"
+                            fb_client.api_key = self.openai_api_key
+                            fb_client.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+                            fb_client.timeout_seconds = self.timeout_seconds
+                            fb_client.is_live = True
+                            fb_client.gemini_api_key = self.gemini_api_key
+                            fb_client.openai_api_key = self.openai_api_key
+                            fb_client.groq_api_key = self.groq_api_key
+                            result = await fb_client._call_openai(query, dialogue_history, constraints, cancellation_event)
+                            logger.info(f"OpenAI fallback succeeded with model={fb_client.model}")
+                            return result
+                    except Exception as e3:
+                        logger.warning(f"{fb_provider} fallback failed: {e3}")
+
+                logger.warning("All live provider fallbacks failed. Using local rules.")
+
+        # Local intelligent fallback — never ask user for API keys configured in .env
+        logger.warning(
+            f"All live providers failed for query '{query[:60]}...'. Using local fallback."
+        )
         return self.generate_fallback_response(query, constraints or {})
 
-    async def _call_gemini(
+    async def stream_response(
+        self,
+        query: str,
+        dialogue_history: Optional[List[Dict[str, str]]] = None,
+        constraints: Optional[Dict[str, Any]] = None,
+        cancellation_event: Optional[asyncio.Event] = None
+    ) -> AsyncGenerator[str, None]:
+        """
+        Streams AI response text incrementally for low-latency TTS pipelining.
+        Falls back to yielding the full response as a single chunk if streaming fails.
+        """
+        if cancellation_event and cancellation_event.is_set():
+            return
+
+        if self.is_live and self.provider == "gemini":
+            try:
+                async for chunk in self._stream_gemini(query, dialogue_history, constraints, cancellation_event):
+                    if chunk:
+                        yield chunk
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Gemini streaming failed: {e}. Falling back to batch generation.")
+
+        # Batch fallback for non-streaming providers or streaming failure
+        text = await self.generate_response(query, dialogue_history, constraints, cancellation_event)
+        if text:
+            yield text
+
+    @staticmethod
+    def _split_sentences(text: str) -> List[str]:
+        """Split buffered text into speakable sentence chunks."""
+        parts = re.split(r'(?<=[.!?])\s+', text.strip())
+        return [p.strip() for p in parts if p.strip()]
+
+    async def _stream_gemini(
         self,
         query: str,
         dialogue_history: Optional[List[Dict[str, str]]],
         constraints: Optional[Dict[str, Any]],
         cancellation_event: Optional[asyncio.Event]
-    ) -> str:
-        """Calls Google Gemini REST API with retry on transient 503 errors."""
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+    ) -> AsyncGenerator[str, None]:
+        """Streams Google Gemini REST API response token-by-token."""
+        models_to_try = [self.model] + [m for m in GEMINI_MODEL_FALLBACKS if m != self.model]
 
+        for model in models_to_try:
+            endpoint = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:streamGenerateContent?alt=sse&key={self.api_key}"
+            )
+            payload = self._build_gemini_payload(query, dialogue_history)
+
+            try:
+                # No total timeout here: a long response can legitimately stream for
+                # much longer than self.timeout_seconds. What actually matters is that
+                # tokens keep arriving — so we bound the gap between reads instead.
+                stream_timeout = aiohttp.ClientTimeout(
+                    total=None,
+                    sock_connect=10,
+                    sock_read=self.timeout_seconds
+                )
+                async with aiohttp.ClientSession(timeout=stream_timeout) as session:
+                    async with session.post(endpoint, json=payload) as resp:
+                        if resp.status == 429:
+                            if resp.status == 429:
+                                logger.warning(f"Gemini 429 on {model}, trying next model immediately...")
+                                continue
+                        if resp.status == 404:
+                            logger.warning(f"Gemini model {model} not available, trying next...")
+                            continue
+                        if resp.status != 200:
+                            err_msg = await resp.text()
+                            raise RuntimeError(f"Gemini API returned {resp.status}: {err_msg[:200]}")
+
+                        buffer = ""
+                        async for raw_line in resp.content:
+                            if cancellation_event and cancellation_event.is_set():
+                                return
+                            line = raw_line.decode("utf-8", errors="ignore").strip()
+                            if not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            if not data_str or data_str == "[DONE]":
+                                continue
+                            try:
+                                data = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+                            candidates = data.get("candidates", [])
+                            if not candidates:
+                                continue
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if not parts:
+                                continue
+                            token = parts[0].get("text", "")
+                            if not token:
+                                continue
+                            buffer += token
+                            # Yield complete sentences for immediate TTS
+                            sentences = self._split_sentences(buffer)
+                            if len(sentences) > 1:
+                                for sent in sentences[:-1]:
+                                    clean = sent.replace("**", "").replace("*", "").replace("```", "").replace("#", "")
+                                    yield clean
+                                buffer = sentences[-1]
+
+                        if buffer.strip():
+                            clean = buffer.strip().replace("**", "").replace("*", "").replace("```", "").replace("#", "")
+                            yield clean
+
+                        logger.info(f"Gemini streaming complete via model={model}")
+                        return
+
+            except asyncio.TimeoutError:
+                logger.warning(f"Gemini stream timeout on {model}")
+                continue
+
+        raise RuntimeError("Gemini streaming failed for all models")
+
+    def _build_gemini_payload(
+        self,
+        query: str,
+        dialogue_history: Optional[List[Dict[str, str]]]
+    ) -> Dict[str, Any]:
         contents = []
         if dialogue_history:
             for item in dialogue_history[-8:]:
@@ -156,64 +311,84 @@ class LLMClient:
                     "role": role,
                     "parts": [{"text": item.get("content") or item.get("text", "")}]
                 })
-
-        contents.append({
-            "role": "user",
-            "parts": [{"text": query}]
-        })
-
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": VOICE_SYSTEM_PROMPT}]
-            },
+        contents.append({"role": "user", "parts": [{"text": query}]})
+        return {
+            "system_instruction": {"parts": [{"text": VOICE_SYSTEM_PROMPT}]},
             "contents": contents,
-            "generationConfig": {
-                "temperature": 0.6,
-                "maxOutputTokens": 250,
-                "topP": 0.9
-            }
+            "generationConfig": {"temperature": 0.6, "maxOutputTokens": 1024, "topP": 0.9}
         }
 
-        max_retries = 3
-        for attempt in range(max_retries):
-            if cancellation_event and cancellation_event.is_set():
-                return ""
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout_seconds)) as session:
-                    async with session.post(endpoint, json=payload) as resp:
-                        if cancellation_event and cancellation_event.is_set():
-                            return ""
+    async def _call_gemini(
+        self,
+        query: str,
+        dialogue_history: Optional[List[Dict[str, str]]],
+        constraints: Optional[Dict[str, Any]],
+        cancellation_event: Optional[asyncio.Event]
+    ) -> str:
+        """Calls Google Gemini REST API with model fallback and retry on transient errors."""
+        models_to_try = [self.model] + [m for m in GEMINI_MODEL_FALLBACKS if m != self.model]
+        last_error = None
 
-                        if resp.status == 503:
-                            # Transient overload — retry with backoff
-                            wait_s = 1.5 * (attempt + 1)
-                            logger.warning(f"Gemini 503 overload (attempt {attempt+1}/{max_retries}), retrying in {wait_s}s...")
-                            await asyncio.sleep(wait_s)
-                            continue
+        for model in models_to_try:
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
+            payload = self._build_gemini_payload(query, dialogue_history)
 
-                        if resp.status != 200:
-                            err_msg = await resp.text()
-                            raise RuntimeError(f"Gemini API returned {resp.status}: {err_msg}")
+            max_retries = 3
+            for attempt in range(max_retries):
+                if cancellation_event and cancellation_event.is_set():
+                    return ""
+                try:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout_seconds)) as session:
+                        async with session.post(endpoint, json=payload) as resp:
+                            if cancellation_event and cancellation_event.is_set():
+                                return ""
 
-                        data = await resp.json()
-                        candidates = data.get("candidates", [])
-                        if candidates:
-                            parts = candidates[0].get("content", {}).get("parts", [])
-                            if parts:
-                                text = parts[0].get("text", "").strip()
-                                text = text.replace("**", "").replace("*", "").replace("```", "").replace("#", "")
-                                logger.info(f"Gemini response received ({len(text)} chars)")
-                                return text
+                            if resp.status == 429:
+                                if resp.status == 429:
+                                    logger.warning(f"Gemini 429 on {model}, trying next model immediately...")
+                                    break
+                            if resp.status == 404:
+                                logger.warning(f"Gemini model {model} not available (404), trying next model...")
+                                last_error = RuntimeError(f"Model {model} not found")
+                                break  # try next model
 
-                        raise RuntimeError("Empty response from Gemini API")
-            except asyncio.TimeoutError:
-                logger.warning(f"Gemini request timed out (attempt {attempt+1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1.0)
-                else:
-                    raise RuntimeError("Gemini API timed out after all retries")
+                            if resp.status == 503:
+                                logger.warning(f"Gemini 503 overload on {model}, trying next model immediately...")
+                                break
 
-        raise RuntimeError("Gemini API failed after all retries")
+                            if resp.status != 200:
+                                err_msg = await resp.text()
+                                raise RuntimeError(f"Gemini API returned {resp.status}: {err_msg[:200]}")
+
+                            data = await resp.json()
+                            candidates = data.get("candidates", [])
+                            if candidates:
+                                parts = candidates[0].get("content", {}).get("parts", [])
+                                if parts:
+                                    text = parts[0].get("text", "").strip()
+                                    text = text.replace("**", "").replace("*", "").replace("```", "").replace("#", "")
+                                    logger.info(f"Gemini response received via {model} ({len(text)} chars)")
+                                    self.model = model  # cache working model
+                                    return text
+
+                            raise RuntimeError("Empty response from Gemini API")
+
+                except asyncio.TimeoutError:
+                    logger.warning(f"Gemini request timed out on {model} (attempt {attempt+1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1.0)
+                    else:
+                        last_error = RuntimeError(f"Gemini API timed out on {model}")
+                except RuntimeError as e:
+                    last_error = e
+                    if "404" in str(e):
+                        break
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1.0)
+                    else:
+                        raise
+
+        raise last_error or RuntimeError("Gemini API failed for all models")
 
     async def _call_openai(
         self,
@@ -404,4 +579,7 @@ class LLMClient:
             return "For shoes under thirty thousand rupees, top recommendations include premium running shoes from Nike, Adidas Ultraboost, or handcrafted leather dress shoes from Johnston and Murphy."
 
         # General intelligent conversational response for any other query
-        return f"Regarding your question about {query}, I am ready to help. I am currently operating in offline fallback mode."
+        # Never ask for API keys — provide a helpful spoken answer instead
+        if "?" in query:
+            return f"That's a great question. Based on what I know, I'd suggest looking into the key aspects of your question and I can help you explore it further when my connection is restored."
+        return f"Got it. Let me know if you'd like me to explain anything else."
