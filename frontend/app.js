@@ -47,17 +47,26 @@ function initAudio() {
 }
 
 // ── WebSocket ─────────────────────────────────────────────
+// ── WebSocket ─────────────────────────────────────────────
 function connectWS() {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const host  = location.hostname || "localhost";
-  const port  ="8000";
-  socket = new WebSocket(`${proto}//${host}:${port}/ws/voice`);
-  socket.onopen  = () => console.log("[WS] Connected");
+  const BACKEND_URL = "https://interrepto-interrepti.onrender.com/";
+  const proto = BACKEND_URL.startsWith("https") ? "wss:" : "ws:";
+  const host = BACKEND_URL.replace(/^https?:\/\//, "");
+
+  socket = new WebSocket(`${proto}//${host}/ws/voice`);
+
+  socket.onopen = () => console.log("[WS] Connected");
+
   socket.onmessage = (ev) => {
-    try { handleMsg(JSON.parse(ev.data)); }
-    catch(e) { console.error("[WS] Parse error:", e); }
+    try {
+      handleMsg(JSON.parse(ev.data));
+    } catch (e) {
+      console.error("[WS] Parse error:", e);
+    }
   };
+
   socket.onerror = (ev) => console.error("[WS] Error:", ev);
+
   socket.onclose = (ev) => {
     console.log(`[WS] Disconnected (code=${ev.code}) — reconnecting in 2s...`);
     setTimeout(connectWS, 2000);
