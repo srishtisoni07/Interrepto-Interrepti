@@ -49,13 +49,15 @@ function initAudio() {
 // ── WebSocket ─────────────────────────────────────────────
 // ── WebSocket ─────────────────────────────────────────────
 function connectWS() {
-  const BACKEND_URL = "https://interrepto-interrepti.onrender.com/";
+  const BACKEND_URL = "https://interrepto-interrepti.onrender.com";
   const proto = BACKEND_URL.startsWith("https") ? "wss:" : "ws:";
   const host = BACKEND_URL.replace(/^https?:\/\//, "");
 
-  socket = new WebSocket(`${proto}//${host}/ws/voice`);
+  socket = new WebSocket(`${proto}//${host}/voice`);
 
-  socket.onopen = () => console.log("[WS] Connected");
+  socket.onopen = () => {
+    console.log("[WS] Connected");
+  };
 
   socket.onmessage = (ev) => {
     try {
@@ -65,14 +67,17 @@ function connectWS() {
     }
   };
 
-  socket.onerror = (ev) => console.error("[WS] Error:", ev);
+  socket.onerror = (ev) => {
+    console.error("[WS] Error:", ev);
+  };
 
   socket.onclose = (ev) => {
-    console.log(`[WS] Disconnected (code=${ev.code}) — reconnecting in 2s...`);
+    console.log(
+      `[WS] Disconnected (code=${ev.code}) — reconnecting in 2s...`
+    );
     setTimeout(connectWS, 2000);
   };
 }
-
 // ── Handle server messages ────────────────────────────────
 function handleMsg(msg) {
   if (msg.type === "cancel_audio") {
